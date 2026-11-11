@@ -8,8 +8,11 @@
 #   --identity FILE  SSH private key (default: ssh's own choice / agent)
 #   --config FILE    kit.env to copy (default: kit.env in the repository root)
 #
-# Steps: validate kit.env, wait for SSH, wait for cloud-init, rsync scripts/ agent/ kit.env
-# docs/hermes-tuning.md to /opt/adk (root-owned, kit.env 0600), sudo /opt/adk/agent/setup.sh.
+# Steps: validate kit.env, check the work tree, wait for SSH, wait for cloud-init, rsync the
+# git-tracked files of scripts/ agent/ docs/hermes-tuning.md plus kit.env to /opt/adk
+# (root-owned, kit.env 0600), sudo /opt/adk/agent/setup.sh.
+# Only git-tracked files are copied; untracked or ignored files under scripts/ or agent/
+# (a stray token, a *.key) abort the run instead of landing world-readable in /opt/adk.
 # Exit codes: 0 = done, 1 = failure, 2 = usage.
 set -euo pipefail
 export LC_ALL=C
@@ -37,7 +40,7 @@ done
 [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || usage
 [[ "$HOST" =~ ^[A-Za-z0-9.:-]+$ ]] || usage
 [[ -f "$CONFIG" ]] || { echo "ERROR: config file not found: $CONFIG" >&2; exit 2; }
-for tool in ssh rsync python3; do
+for tool in ssh rsync python3 git tar; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required on this machine"
 done
 
@@ -45,6 +48,23 @@ done
   "$ROOT/scripts/check-config.sh" "$CONFIG" || true
   die "fix $CONFIG first"
 }
+
+# --- what is copied: git-tracked files only ---------------------------------
+SYNC_PATHS=(scripts agent docs/hermes-tuning.md)
+git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || die "$ROOT is not a git work tree; bootstrap copies only git-tracked files"
+stray="$(git -C "$ROOT" status --porcelain --ignored --untracked-files=all -- "${SYNC_PATHS[@]}" \
+  | grep -E '^(\?\?|!!) ' || true)"
+if [[ -n "$stray" ]]; then
+  printf '%s\n' "$stray" >&2
+  die "untracked or ignored files under scripts/ or agent/ (see above); move them out of the repository first"
+fi
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir "$STAGE/kit"
+git -C "$ROOT" ls-files -z -- "${SYNC_PATHS[@]}" \
+  | (cd "$ROOT" && tar --null -T - -cf -) | tar -xf - -C "$STAGE/kit" \
+  || die "cannot stage the tracked files (deleted but not committed?)"
 
 TARGET="$USER_NAME@$HOST"
 [[ "$HOST" == *:* ]] && TARGET="$USER_NAME@[$HOST]"   # IPv6 literal for rsync
@@ -54,8 +74,16 @@ remote() { ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$@"; }
 
 echo "== waiting for SSH on $HOST (up to ${WAIT_SECONDS}s)"
 deadline=$((SECONDS + WAIT_SECONDS))
-until remote true 2>/dev/null; do
-  ((SECONDS < deadline)) || die "no SSH login as $USER_NAME on $HOST"
+until remote true 2>"$STAGE/ssh.err"; do
+  if grep -qE 'IDENTIFICATION HAS CHANGED|Host key verification failed' "$STAGE/ssh.err"; then
+    cat "$STAGE/ssh.err" >&2
+    die "the host key of $HOST differs from known_hosts (reused IP?). If that is expected: ssh-keygen -R $HOST, then re-run"
+  fi
+  if ((SECONDS >= deadline)); then
+    echo "last ssh error:" >&2
+    tail -n 5 "$STAGE/ssh.err" >&2
+    die "no SSH login as $USER_NAME on $HOST"
+  fi
   sleep 5
 done
 
@@ -73,10 +101,10 @@ echo "== copying the kit to $REMOTE_DIR"
 remote "sudo install -d -m 0755 -o root -g root $REMOTE_DIR"
 RSYNC_SSH="ssh $(printf '%q ' "${SSH_OPTS[@]}")"
 (
-  cd "$ROOT"
+  cd "$STAGE/kit"
   rsync -rlp --delete --relative --chown=root:root --chmod=D0755,Fu+rw,Fgo-w,Fa+r,Fa+X \
-    --exclude '__pycache__' -e "$RSYNC_SSH" --rsync-path="sudo rsync" \
-    ./scripts ./agent ./docs/hermes-tuning.md "$TARGET:$REMOTE_DIR/"
+    -e "$RSYNC_SSH" --rsync-path="sudo rsync" \
+    "${SYNC_PATHS[@]/#/./}" "$TARGET:$REMOTE_DIR/"
 )
 rsync -p --chown=root:root --chmod=F0600 -e "$RSYNC_SSH" --rsync-path="sudo rsync" \
   "$CONFIG" "$TARGET:$REMOTE_DIR/kit.env"
@@ -85,5 +113,5 @@ echo "== running setup.sh"
 remote "sudo $REMOTE_DIR/agent/setup.sh"
 
 echo
-echo "Done. Add the employee's key for Hermes Desktop:"
-echo "  scp key.pub $SSH_TARGET:/tmp/ && ssh $SSH_TARGET sudo $REMOTE_DIR/agent/add-key.sh hermes /tmp/key.pub"
+echo "Done. Add the employee's key for Hermes Desktop (read from stdin, never staged on the VPS):"
+echo "  ssh $SSH_TARGET sudo $REMOTE_DIR/agent/add-key.sh hermes < mitarbeiter.pub"
