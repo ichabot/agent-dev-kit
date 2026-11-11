@@ -154,7 +154,9 @@ adk_gpg_key_fpr_is() {
 }
 
 # adk_egress_rules UID...: nftables ruleset (table inet adk_egress) that rejects traffic from
-# these users to the cloud metadata service (reject, not drop: connect() fails at once with
+# these users to the cloud metadata service and to containers of the ROOT Docker daemon other
+# than their ports 80/443 (Caddy; also reached there after Docker's DNAT of the host address),
+# so Gitea is reachable only through Caddy (reject, not drop: connect() fails at once with
 # EHOSTUNREACH instead of hanging until a timeout). Loaded by adk-egress.service with nft -f;
 # replaces the table as a whole, so re-loading is idempotent. Add more uids (e.g. ci) as
 # arguments; root (0) is refused because the kit's own services need nothing from it either
@@ -170,7 +172,8 @@ adk_egress_rules() {
   cat <<EOF
 # agent-dev-kit: egress limits for unprivileged users (agent/setup.sh, adk-egress.service).
 # Real boundary behind sshd's PermitOpen: these uids (and their rootless containers, whose
-# traffic leaves through the user's slirp4netns) cannot reach the cloud metadata service.
+# traffic leaves through the user's slirp4netns) cannot reach the cloud metadata service, nor
+# root Docker containers except on ports 80/443 (Gitea only through Caddy).
 table inet adk_egress {}
 delete table inet adk_egress
 table inet adk_egress {
@@ -190,6 +193,10 @@ table inet adk_egress {
     type filter hook output priority filter; policy accept;
     meta skuid @restricted_uids ip daddr @metadata_v4 counter reject with icmpx admin-prohibited comment "cloud metadata"
     meta skuid @restricted_uids ip6 daddr @metadata_v6 counter reject with icmpx admin-prohibited comment "cloud metadata"
+    meta skuid @restricted_uids oifname "br-*" tcp dport { 80, 443 } accept
+    meta skuid @restricted_uids oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"
+    meta skuid @restricted_uids oifname "docker0" tcp dport { 80, 443 } accept
+    meta skuid @restricted_uids oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"
   }
 }
 EOF

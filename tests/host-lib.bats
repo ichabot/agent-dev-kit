@@ -275,6 +275,15 @@ snapshot() {
   [[ "$output" == *"elements = { 1000 }"* ]]
 }
 
+@test "adk_egress_rules keeps the uids away from root Docker containers except ports 80/443" {
+  run adk_egress_rules 1001 1002
+  [ "$status" -eq 0 ]
+  # published ports (Caddy) stay reachable, also after Docker's DNAT of the host address
+  [[ "$output" == *'meta skuid @restricted_uids oifname "br-*" tcp dport { 80, 443 } accept'* ]]
+  [[ "$output" == *'meta skuid @restricted_uids oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
+  [[ "$output" == *'meta skuid @restricted_uids oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
+}
+
 @test "adk_egress_rules refuses non-numeric or root uids" {
   run adk_egress_rules hermes
   [ "$status" -ne 0 ]
