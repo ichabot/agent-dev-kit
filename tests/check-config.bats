@@ -147,6 +147,54 @@ set_var() {
   [ "$status" -eq 0 ]
 }
 
+@test "GITEA_ADMIN_USER follows the Gitea username rules" {
+  for bad in "a" "Ad-min" "-anna" "anna-" "an..na" "anna mueller" "$(printf 'a%.0s' {1..40})"; do
+    set_var GITEA_ADMIN_USER "$bad"
+    run "$CHECK" "$CFG"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"GITEA_ADMIN_USER"* ]]
+  done
+  for good in "am" "anna.mueller" "a_b-c" "$(printf 'a%.0s' {1..39})"; do
+    set_var GITEA_ADMIN_USER "$good"
+    run "$CHECK" "$CFG"
+    [ "$status" -eq 0 ]
+  done
+}
+
+@test "GITEA_ADMIN_USER must not be a reserved or kit account name" {
+  for bad in admin root agent-bot prod-pull ghost gitea-actions; do
+    set_var GITEA_ADMIN_USER "$bad"
+    run "$CHECK" "$CFG"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"GITEA_ADMIN_USER"*"reserved"* ]]
+  done
+}
+
+@test "GITEA_ADMIN_USER must differ from CUSTOMER_NAME (the organization)" {
+  set_var GITEA_ADMIN_USER acme
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"GITEA_ADMIN_USER"*"CUSTOMER_NAME"* ]]
+}
+
+@test "CUSTOMER_NAME must not be a reserved or kit account name (it becomes the Gitea org)" {
+  set_var CUSTOMER_NAME agent-bot
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"CUSTOMER_NAME"*"reserved"* ]]
+}
+
+@test "GITEA_ADMIN_EMAIL must be an e-mail address" {
+  set_var GITEA_ADMIN_EMAIL "anna.example.com"
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"GITEA_ADMIN_EMAIL"* ]]
+  set_var GITEA_ADMIN_EMAIL ""
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"GITEA_ADMIN_EMAIL: empty"* ]]
+}
+
 @test "unknown key is rejected (typo protection)" {
   set_var GITEA_DOMIAN "git.example.com"
   run "$CHECK" "$CFG"

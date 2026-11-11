@@ -81,6 +81,30 @@ if [[ -n "$v" && ! "$v" =~ ^[a-z][a-z0-9-]{0,29}[a-z0-9]$ ]]; then
   err CUSTOMER_NAME "use 2-31 chars: a-z, 0-9, '-' (letter first, no '-' at the end)"
 fi
 
+# Gitea user and organization names share one namespace; these are taken by Gitea itself or
+# by the kit's own accounts (agent/gitea-init.sh).
+GITEA_RESERVED=(admin root agent-bot prod-pull ghost gitea-actions api assets explore org repo user
+  users v2 login new notifications issues pulls milestones raw search avatars attachments)
+is_reserved() {
+  local r
+  for r in "${GITEA_RESERVED[@]}"; do [[ "$r" == "$1" ]] && return 0; done
+  return 1
+}
+if [[ -n "$v" ]] && is_reserved "$v"; then
+  err CUSTOMER_NAME "'$v' is reserved in Gitea or by the kit (it becomes the Gitea organization)"
+fi
+
+v="$(val GITEA_ADMIN_USER)"
+if [[ -n "$v" ]]; then
+  if [[ ! "$v" =~ ^[a-z0-9]([a-z0-9._-]{0,37}[a-z0-9])?$ || ${#v} -lt 2 || "$v" =~ [._-]{2} ]]; then
+    err GITEA_ADMIN_USER "use 2-39 chars: a-z, 0-9, '.', '_', '-' (letter or digit first and last, no two symbols in a row)"
+  elif is_reserved "$v"; then
+    err GITEA_ADMIN_USER "'$v' is reserved in Gitea or by the kit"
+  elif [[ "$v" == "$(val CUSTOMER_NAME)" ]]; then
+    err GITEA_ADMIN_USER "must differ from CUSTOMER_NAME (that name is the Gitea organization)"
+  fi
+fi
+
 v="$(val CUSTOMER_IPS)"
 if [[ -n "$v" ]]; then
   # Shared rules (scripts/lib/cidr.py), isolated interpreter (-I: no cwd or script dir on
@@ -113,10 +137,12 @@ for k in GITEA_DOMAIN TEST_DOMAIN; do
   [[ -n "$v" ]] && check_domain "$k" "$v"
 done
 
-v="$(val ACME_EMAIL)"
-if [[ -n "$v" && ! "$v" =~ ^[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$ ]]; then
-  err ACME_EMAIL "not a valid e-mail address"
-fi
+for k in ACME_EMAIL GITEA_ADMIN_EMAIL; do
+  v="$(val "$k")"
+  if [[ -n "$v" && ! "$v" =~ ^[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$ ]]; then
+    err "$k" "not a valid e-mail address"
+  fi
+done
 
 case "$(val ACME_MODE)" in
   ""|http01) ;;
