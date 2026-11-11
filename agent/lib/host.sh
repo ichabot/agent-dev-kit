@@ -153,8 +153,9 @@ adk_gpg_key_fpr_is() {
   [[ "$(awk -F: '$1 == "pub" {p = 1; next} p && $1 == "fpr" {print $10; exit}' <<< "$out")" == "$want" ]]
 }
 
-# adk_egress_rules UID...: nftables ruleset (table inet adk_egress) that drops traffic from
-# these users to the cloud metadata service. Loaded by adk-egress.service with nft -f;
+# adk_egress_rules UID...: nftables ruleset (table inet adk_egress) that rejects traffic from
+# these users to the cloud metadata service (reject, not drop: connect() fails at once with
+# EHOSTUNREACH instead of hanging until a timeout). Loaded by adk-egress.service with nft -f;
 # replaces the table as a whole, so re-loading is idempotent. Add more uids (e.g. ci) as
 # arguments; root (0) is refused because the kit's own services need nothing from it either
 # way and a typo must not lock root out.
@@ -187,8 +188,8 @@ table inet adk_egress {
   }
   chain output {
     type filter hook output priority filter; policy accept;
-    meta skuid @restricted_uids ip daddr @metadata_v4 counter drop comment "cloud metadata"
-    meta skuid @restricted_uids ip6 daddr @metadata_v6 counter drop comment "cloud metadata"
+    meta skuid @restricted_uids ip daddr @metadata_v4 counter reject with icmpx admin-prohibited comment "cloud metadata"
+    meta skuid @restricted_uids ip6 daddr @metadata_v6 counter reject with icmpx admin-prohibited comment "cloud metadata"
   }
 }
 EOF

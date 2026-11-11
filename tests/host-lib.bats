@@ -269,7 +269,8 @@ snapshot() {
   [[ "$output" == *"169.254.169.254"* ]]
   [[ "$output" == *"fd00:ec2::254"* ]]
   [[ "$output" == *"hook output"* ]]
-  [[ "$output" == *"meta skuid @restricted_uids"*"drop"* ]]
+  [[ "$output" == *"meta skuid @restricted_uids ip daddr @metadata_v4 counter reject"* ]]
+  [[ "$output" == *"meta skuid @restricted_uids ip6 daddr @metadata_v6 counter reject"* ]]
   run adk_egress_rules 1000
   [[ "$output" == *"elements = { 1000 }"* ]]
 }
