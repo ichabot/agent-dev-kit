@@ -1,0 +1,13 @@
+[Unit]
+Description=agent-dev-kit: start Gitea again if a backup stopped it and the server went down meanwhile
+Documentation=file:///opt/adk/agent/backup.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# no-op unless /var/backups/adk/.gitea-stopped-by-backup exists
+ExecStart=/opt/adk/agent/backup.sh --ensure-gitea
+
+[Install]
+WantedBy=multi-user.target

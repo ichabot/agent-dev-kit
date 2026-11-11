@@ -86,12 +86,19 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 **Security-Gate:** Exponiert SSH, Gitea (443), VPN – alles nur für `CUSTOMER_IPS` (Hetzner Cloud Firewall) und zusätzlich nur an den nötigen Interfaces gebunden. Ausgehend offen (LLM-API, Pakete, ACME). Blast-Radius Agent: User `hermes` ohne root/Docker-Gruppe; Gitea-Bot `agent-bot` ohne Admin, `main` geschützt (Merge nur nach Freigabe durch Mitarbeiter-Account).
 
 **Dateien (2a):** `agent/provision.sh` (hcloud: Server, Firewall, Backups an), `agent/firewall-rules.sh`, `agent/cloud-init.yaml.tmpl` + `agent/render-cloud-init.sh`, `agent/sshd-adk.conf`, `agent/bootstrap.sh`, `agent/setup.sh` (inkl. Hermes-Installation), `agent/add-key.sh`, `agent/remove-key.sh`, `agent/lib/*`; Tests flach unter `tests/*.bats`.
-**Dateien (2b, geplant):** `agent/compose.yaml` (Gitea, act_runner, Caddy), `agent/Caddyfile.tmpl`, `agent/backup.sh`, `agent/systemd/*.timer`.
+**Dateien (2b):** `agent/render-services.sh` (erzeugt `/opt/adk/services/compose.yaml` mit Gitea + Caddy, `Caddyfile`, Caddy-Dockerfile für DNS-01 und `/etc/adk/runner.yaml`), `agent/lib/services.sh` (Setup-Schritte: Secrets, Compose, Runner als User `ci` mit systemd-Unit `adk-act-runner.service`, Backup-Timer), `agent/lib/versions.sh` (Versionen + Digests/sha256), `agent/gitea-init.sh`, `agent/set-secret.sh`, `agent/backup.sh`, `agent/restore.sh`, `agent/systemd/adk-backup.{service,timer}`; Tests `tests/{render-services,set-secret,gitea-init,backup,restore}.bats`. Der Runner läuft nicht in Compose, sondern als Systemdienst mit dem rootless Docker von `ci`.
 
 **Hinweise für 2b (aus dem Review von 2a):**
 - `PermitOpen 127.0.0.1:*` gibt `hermes` auch Loopback-Admin-Endpunkte frei, z. B. Caddys Admin-API auf `:2019`. In 2b abschalten (`admin off`) oder auf einen Unix-Socket legen; generell keine Admin-Endpunkte ohne Auth auf Loopback.
 - Der CI-User `ci` kommt in die nftables-Egress-Regeln (`adk_egress_rules` in `agent/lib/host.sh`, zweite uid), damit auch CI-Jobs den Metadaten-Dienst nicht erreichen.
 - Keine Secrets in user_data oder Metadaten (Metadaten-Sperre ist nur für die eingeschränkten uids).
+
+**Ergebnisse aus 2b:**
+- `agent-bot` darf keine Repos anlegen (Organisation: Team ohne Repo-Anlage; eigener Namensraum: `max_repo_creation 0`): Gitea macht den Ersteller eines Repos zu dessen Admin, damit könnte der Agent den Branch-Schutz abschalten. Repos legt der Mitarbeiter an.
+- `agent-bot` und `prod-pull` sind Gitea-Bot-Konten (kein Passwort, keine Web-Anmeldung). `agent-bot` schreibt Code/Issues/PRs/Wiki, liest Releases, Packages und Actions nur; Token-Scopes ohne `write:package`.
+- Branch- und Tag-Schutz pro Repo setzt `agent/protect-repo.sh <org>/<repo>` (root, idempotent): Standard-Branch nur per PR, Merge und Freigabe nur durch den Mitarbeiter, Tags nur durch den Mitarbeiter. `gitea-init.sh`/`setup.sh` warnen bei ungeschützten Repos. PR 5: Skill „Projekt anlegen“ bittet den Mitarbeiter, das Repo anzulegen und `protect-repo.sh` auszuführen (oder ausführen zu lassen).
+- CI: ein Job pro Runner-Lauf (ephemere Registrierung), root setzt die Umgebung von `ci` vor und nach jedem Job komplett zurück (`agent/ci-reset.sh`). Kein Job kann einen späteren beeinflussen; Basis-Images werden je Job neu geladen.
+- Jeder Branch-Workflow liest alle Actions-Secrets seines Repos (auch ein `write:package`-Token für Registry-Pushes; das Job-Token selbst lehnt die Registry ab) → keine langlebigen Secrets in Repo-Actions-Secrets, PROD vertraut keinen Registry-Tags (siehe PR 4).
 
 **Regeln:**
 - SSH nur Key, kein Passwort, kein root-Login nach Setup (eigener Admin-User mit sudo).
@@ -148,7 +155,21 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 7. Fehler in 6 → automatischer Rollback (DB-Restore + alte Version). Protokoll in `update.log`.
 - Weitere Befehle: `--list` (Versionen), `--status`, `--rollback` (letztes Backup), Aufbewahrung `KEEP_BACKUPS=10`.
 
-**CI:** Tests → Lint → Image bauen → **Upgrade-Test** (letzte Release-Version mit Testdaten starten, auf neuen Stand aktualisieren, Zeilenanzahl/Prüfsummen vorher = nachher, außer bei freigegebenen `changing`-Migrationen) → Deploy TEST. Release über Tag `vX.Y.Z`, nur Mitarbeiter darf taggen.
+**CI:** Tests → Lint → Image bauen → **Upgrade-Test** (letzte Release-Version mit Testdaten starten, auf neuen Stand aktualisieren, Zeilenanzahl/Prüfsummen vorher = nachher, außer bei freigegebenen `changing`-Migrationen) → Deploy TEST. Release über Tag `vX.Y.Z`, nur Mitarbeiter darf taggen (geschützte Tags per `protect-repo.sh`).
+
+**Vorgaben aus dem Review von PR 2b (hier umzusetzen):**
+- **PROD vertraut keinen Registry-Tags.** Die Registry lehnt das Job-Token ab (Gitea 28.3); ein Push aus CI braucht ein `write:package`-Token als Actions-Secret, und das liest jeder Workflow – auch einer, den der Agent auf einem Feature-Branch pusht. Er kann damit Images pushen und Tags überschreiben. `update.sh` zieht deshalb nur den **Image-Digest, den das Release festhält**, das der Mitarbeiter auf einem geschützten Tag erstellt (z. B. Digest in den Release-Notizen oder einer Release-Datei, die nur der Release-Workflow des geschützten Tags schreibt), und prüft das gezogene Image gegen diesen Digest.
+- Der Release-Workflow muss so gebaut sein, dass ein Branch-Job diesen Eintrag weder erzeugen noch ändern kann (Job-Token-Rechte mit `permissions:` einschränken, Release-Schritt nur bei `refs/tags/v*` auf dem geschützten Tag, Digest aus dem Build desselben Laufs; prüfen, ob ein Branch-Job ein Release eines geschützten Tags bearbeiten kann – sonst Signatur, z. B. cosign mit einem Schlüssel, den kein Job sieht).
+- **Keine langlebigen Secrets in Actions-Secrets der Repos** (jeder Branch-Workflow liest sie). Der TEST-Deploy-Key (PR 3) ist per `command=` auf `deploy.sh` beschränkt und darf nur TEST erreichen.
+- `uses:`-Actions per Commit-SHA festlegen oder auf Gitea spiegeln (`DEFAULT_ACTIONS_URL` zeigt auf GitHub, Tags sind veränderlich).
+
+**Harte Vorgaben aus dem zweiten Review von PR 2b (Vertrauensanker für PROD):**
+- Job-Tokens von Branch-Workflows können Releases und Commit-Status bearbeiten und mit einem `write:package`-Secret Registry-Tags überschreiben. Deshalb darf PROD seine Entscheidung **weder auf Release-Notizen oder Release-Dateien stützen, die CI schreibt, noch auf Registry-Tags**. Ein von CI geschriebener Digest im Release ist kein Vertrauensanker, solange ein Branch-Job dasselbe Release ändern kann.
+- In PR 4 zu bewerten und zu entscheiden (mit Test, dass ein Branch-Job den Anker nicht fälschen kann):
+  - Digest-Datei, die der **Mitarbeiter signiert** (z. B. `ssh-keygen -Y sign` oder cosign mit einem Schlüssel, den nur der Mitarbeiter hat, nie als Actions-Secret); `update.sh` prüft die Signatur gegen einen auf PROD hinterlegten öffentlichen Schlüssel.
+  - Oder: PROD baut das Image selbst aus dem vom Mitarbeiter getaggten Commit (geschützter Tag, Commit-SHA geprüft) statt ein Image aus der Registry zu ziehen.
+- Release-Builds dürfen nicht `FROM` veränderliche Tags der eigenen Registry bauen (Basis-Images nur per Digest oder aus vertrauenswürdigen Quellen), sonst kann ein Branch-Job über ein überschriebenes Basis-Image in das Release gelangen.
+- `protect-repo.sh --status-check` ist nur Komfort (der Status kommt aus CI und kann von Branch-Jobs gesetzt werden), kein Sicherheitsmerkmal; die Freigabe des Mitarbeiters ist die Kontrolle.
 
 **Tasks:** je ein bats-Test zuerst für: Plan-Anzeige, Abbruch ändert nichts, `changing` ohne Versionseingabe abgelehnt, kein Backup → kein Update, Health-Fehler → Rollback, `--rollback` stellt Daten wieder her, `.env` unverändert nach Update, Lint erkennt verbotene Statements.
 

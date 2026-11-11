@@ -143,8 +143,90 @@ set_var() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"BACKUP_TARGET"* ]]
   set_var BACKUP_TARGET "sftp://u123@u123.your-storagebox.de/backups"
+  set_var BACKUP_AGE_RECIPIENT "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
   run "$CHECK" "$CFG"
   [ "$status" -eq 0 ]
+}
+
+@test "BACKUP_TARGET requires BACKUP_AGE_RECIPIENT (off-site copies are encrypted)" {
+  set_var BACKUP_TARGET "sftp://u123@u123.your-storagebox.de/backups"
+  set_var BACKUP_AGE_RECIPIENT ""
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"BACKUP_AGE_RECIPIENT"*"BACKUP_TARGET"* ]]
+}
+
+@test "BACKUP_AGE_RECIPIENT must be an age X25519 public key" {
+  for bad in "age1short" "AGE1QL3Z7HJY54PW3HYWW5AYYFG7ZQGVC7W3J2ELW8ZMRJ2KG5SFN9AQMCAC8P" \
+      "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ" \
+      "ssh-ed25519" "age1bl3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"; do
+    set_var BACKUP_AGE_RECIPIENT "$bad"
+    run "$CHECK" "$CFG"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"BACKUP_AGE_RECIPIENT"* ]]
+  done
+  set_var BACKUP_AGE_RECIPIENT "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 0 ]
+}
+
+@test "DNS_PROVIDER=hetzner with dns01: warning about the project-wide Cloud API token" {
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING: DNS_PROVIDER=hetzner"*"separate Hetzner project"* ]]
+  set_var DNS_PROVIDER cloudflare
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARNING"* ]]
+}
+
+@test "GITEA_ADMIN_USER follows the Gitea username rules" {
+  for bad in "a" "Ad-min" "-anna" "anna-" "an..na" "anna mueller" "$(printf 'a%.0s' {1..40})"; do
+    set_var GITEA_ADMIN_USER "$bad"
+    run "$CHECK" "$CFG"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"GITEA_ADMIN_USER"* ]]
+  done
+  for good in "am" "anna.mueller" "a_b-c" "$(printf 'a%.0s' {1..39})"; do
+    set_var GITEA_ADMIN_USER "$good"
+    run "$CHECK" "$CFG"
+    [ "$status" -eq 0 ]
+  done
+}
+
+@test "GITEA_ADMIN_USER must not be a reserved or kit account name" {
+  for bad in admin root agent-bot prod-pull ghost gitea-actions help install metrics avatar \
+      captcha commits debug error repo-avatars ssh_info anna.keys anna.gpg anna.rss anna.atom anna.png; do
+    set_var GITEA_ADMIN_USER "$bad"
+    run "$CHECK" "$CFG"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"GITEA_ADMIN_USER"*"reserved"* ]]
+  done
+}
+
+@test "GITEA_ADMIN_USER must differ from CUSTOMER_NAME (the organization)" {
+  set_var GITEA_ADMIN_USER acme
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"GITEA_ADMIN_USER"*"CUSTOMER_NAME"* ]]
+}
+
+@test "CUSTOMER_NAME must not be a reserved or kit account name (it becomes the Gitea org)" {
+  set_var CUSTOMER_NAME agent-bot
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"CUSTOMER_NAME"*"reserved"* ]]
+}
+
+@test "GITEA_ADMIN_EMAIL must be an e-mail address" {
+  set_var GITEA_ADMIN_EMAIL "anna.example.com"
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"GITEA_ADMIN_EMAIL"* ]]
+  set_var GITEA_ADMIN_EMAIL ""
+  run "$CHECK" "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"GITEA_ADMIN_EMAIL: empty"* ]]
 }
 
 @test "unknown key is rejected (typo protection)" {
@@ -311,6 +393,7 @@ set_var() {
   run "$CHECK" "$CFG"
   [ "$status" -eq 1 ]
   set_var BACKUP_TARGET "sftp://u123@u123.your-storagebox.de:23/backups/acme"
+  set_var BACKUP_AGE_RECIPIENT "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
   run "$CHECK" "$CFG"
   [ "$status" -eq 0 ]
 }

@@ -107,3 +107,21 @@ EOF
   [[ "$output" == *"add-key.sh hermes < "* ]]
   [[ "$output" != *"/tmp"* ]]
 }
+
+@test "runs setup.sh without lab overrides by default" {
+  run env -u ADK_TLS_INTERNAL -u ADK_RUNNER_ADD_HOST "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50
+  [ "$status" -eq 0 ]
+  grep -qE ' sudo /opt/adk/agent/setup.sh$' "$SSH_LOG"
+}
+
+@test "lab overrides are passed to setup.sh only when valid" {
+  ADK_TLS_INTERNAL=1 ADK_RUNNER_ADD_HOST=203.0.113.50 run "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50
+  [ "$status" -eq 0 ]
+  grep -qE ' sudo ADK_TLS_INTERNAL=1 ADK_RUNNER_ADD_HOST=203.0.113.50 /opt/adk/agent/setup.sh$' "$SSH_LOG"
+  : > "$SSH_LOG"
+  ADK_RUNNER_ADD_HOST='203.0.113.9;id' run "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50
+  [ "$status" -eq 2 ]
+  [ ! -s "$SSH_LOG" ]
+  ADK_TLS_INTERNAL=yes run "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50
+  [ "$status" -eq 2 ]
+}

@@ -8,6 +8,8 @@
 # user plants cannot redirect root to a system file.
 
 ADK_CHANGES=${ADK_CHANGES:-0}
+# First uid/gid of regular users: owners below it are system accounts (root, daemon, ...).
+ADK_UID_MIN=1000
 _ADK_HOST_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 adk_ok() { echo "ok: $*"; }
@@ -40,6 +42,17 @@ adk_put_file() {
   return "$changed"
 }
 
+# adk_resolved_conf: systemd-resolved drop-in. Debian's cloud images answer LLMNR on
+# 0.0.0.0:5355 (and could do mDNS); nothing on this server needs either.
+adk_resolved_conf() {
+  cat <<'EOF'
+# agent-dev-kit: no LLMNR/mDNS listeners (only ssh and https are open)
+[Resolve]
+LLMNR=no
+MulticastDNS=no
+EOF
+}
+
 # adk_apt_install PKG...: install the packages that are missing (apt-get update only then)
 adk_apt_install() {
   local missing=() p
@@ -61,6 +74,13 @@ adk_apt_install() {
 # adk_user_home USER: home directory from the passwd database
 adk_user_home() { getent passwd "$1" | cut -d: -f6; }
 
+# _adk_close_private_fds: close the descriptors a child running as another user must never
+# inherit: the Gitea admin lock (lib/gitea-admin.sh), which a process of that user could keep
+# open to block every later run. Call it in the subshell that starts the child.
+_adk_close_private_fds() {
+  if [[ -n "${_ADK_GITEA_LOCK_FD:-}" ]]; then exec {_ADK_GITEA_LOCK_FD}>&-; fi
+}
+
 # adk_as_user USER CMD...: run CMD as USER with a minimal environment, cwd = the user's home
 # (the caller's cwd may be unreadable for the user). ADK_AS_USER_HOOK replaces the switch
 # for tests; it is ignored when running as root.
@@ -68,14 +88,14 @@ adk_as_user() {
   local user="$1" home
   shift
   if [[ -n "${ADK_AS_USER_HOOK:-}" && "$(id -u)" -ne 0 ]]; then
-    "$ADK_AS_USER_HOOK" "$user" "$@"
+    (_adk_close_private_fds && exec "$ADK_AS_USER_HOOK" "$user" "$@")
     return
   fi
   home="$(adk_user_home "$user")"
   [[ -n "$home" ]] || adk_die "no home directory for $user"
   # The cd into the home happens as the user, not as root.
   # shellcheck disable=SC2016  # expanded by the inner sh
-  (cd / && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
+  (cd / && _adk_close_private_fds && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
     PATH=/usr/bin:/bin LC_ALL=C sh -c 'cd "$HOME" 2>/dev/null || cd /; exec "$@"' sh "$@")
 }
 
@@ -87,7 +107,7 @@ adk_user_env() {
   uid="$(id -u "$user")"
   home="$(adk_user_home "$user")"
   # shellcheck disable=SC2016  # expanded by the inner sh
-  (cd / && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash \
+  (cd / && _adk_close_private_fds && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash \
     PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
     sh -c 'cd "$HOME" 2>/dev/null || cd /; exec "$@"' sh "$@")
@@ -153,30 +173,66 @@ adk_gpg_key_fpr_is() {
   [[ "$(awk -F: '$1 == "pub" {p = 1; next} p && $1 == "fpr" {print $10; exit}' <<< "$out")" == "$want" ]]
 }
 
-# adk_egress_rules UID...: nftables ruleset (table inet adk_egress) that rejects traffic from
-# these users to the cloud metadata service (reject, not drop: connect() fails at once with
-# EHOSTUNREACH instead of hanging until a timeout). Loaded by adk-egress.service with nft -f;
-# replaces the table as a whole, so re-loading is idempotent. Add more uids (e.g. ci) as
-# arguments; root (0) is refused because the kit's own services need nothing from it either
-# way and a typo must not lock root out.
+# adk_subid_ranges FILE USER UID: "start-end" for each line of /etc/subuid or /etc/subgid that
+# belongs to USER (by name or numeric id)
+adk_subid_ranges() {
+  awk -F: -v u="$2" -v id="$3" '($1 == u || $1 == id) && $2 ~ /^[0-9]+$/ && $3 ~ /^[1-9][0-9]*$/ {printf "%d-%d\n", $2, $2 + $3 - 1}' "$1"
+}
+
+# adk_egress_rules "UID|RANGE..." "GID|RANGE...": nftables ruleset (table inet adk_egress)
+# that rejects traffic of the restricted users to the cloud metadata service and to
+# containers of the ROOT Docker daemon other than their ports 80/443 (Caddy; also reached
+# there after Docker's DNAT of the host address), so Gitea is reachable only through Caddy
+# (reject, not drop: connect() fails at once with EHOSTUNREACH instead of a timeout).
+# Restricted are sockets of
+#   - the given uids and gids, incl. ranges "lo-hi" for the users' /etc/subuid and
+#     /etc/subgid ranges: a user namespace (unshare --map-auto, rootless containers on the
+#     host network) can switch to those ids but never to others;
+#   - every process in the cgroup user.slice (all user sessions and user managers, so also
+#     rootless Docker and its containers, whatever their ids) as a second layer. The path is
+#     resolved when the table is loaded; user.slice is static, adk-egress.service creates it.
+# Loaded by adk-egress.service with nft -f; replaces the table as a whole (idempotent). Root
+# (0) is refused as an id: a typo must not cut root off.
 adk_egress_rules() {
-  local u joined
-  (($#)) || { echo "ERROR: adk_egress_rules: no uid given" >&2; return 1; }
-  for u in "$@"; do
-    [[ "$u" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: adk_egress_rules: not a non-root uid: $u" >&2; return 1; }
+  local kind list e lo hi out joined_uids="" joined_gids=""
+  local -A seen
+  (($# == 2)) || { echo "ERROR: adk_egress_rules: need a uid list and a gid list" >&2; return 1; }
+  for kind in uid gid; do
+    if [[ "$kind" == uid ]]; then list="$1"; else list="$2"; fi
+    seen=() out=""
+    for e in ${list//,/ }; do
+      if [[ "$e" =~ ^([1-9][0-9]*)-([1-9][0-9]*)$ ]]; then
+        lo="${BASH_REMATCH[1]}" hi="${BASH_REMATCH[2]}"
+        ((lo <= hi)) || { echo "ERROR: adk_egress_rules: reversed range: $e" >&2; return 1; }
+      elif [[ ! "$e" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: adk_egress_rules: not a non-root $kind or range: $e" >&2
+        return 1
+      fi
+      [[ -z "${seen[$e]:-}" ]] || continue
+      seen[$e]=1
+      out+="${out:+, }$e"
+    done
+    [[ -n "$out" ]] || { echo "ERROR: adk_egress_rules: no $kind given" >&2; return 1; }
+    if [[ "$kind" == uid ]]; then joined_uids="$out"; else joined_gids="$out"; fi
   done
-  printf -v joined '%s, ' "$@"
-  joined="${joined%, }"
   cat <<EOF
 # agent-dev-kit: egress limits for unprivileged users (agent/setup.sh, adk-egress.service).
-# Real boundary behind sshd's PermitOpen: these uids (and their rootless containers, whose
-# traffic leaves through the user's slirp4netns) cannot reach the cloud metadata service.
+# Real boundary behind sshd's PermitOpen: these uids/gids (incl. their subordinate ranges) and
+# everything in user.slice (sessions, user managers, rootless Docker and its containers,
+# whose traffic leaves through slirp4netns) cannot reach the cloud metadata service, nor root
+# Docker containers except on ports 80/443 (Gitea only through Caddy).
 table inet adk_egress {}
 delete table inet adk_egress
 table inet adk_egress {
   set restricted_uids {
     type uid
-    elements = { $joined }
+    flags interval
+    elements = { $joined_uids }
+  }
+  set restricted_gids {
+    type gid
+    flags interval
+    elements = { $joined_gids }
   }
   set metadata_v4 {
     type ipv4_addr
@@ -186,11 +242,125 @@ table inet adk_egress {
     type ipv6_addr
     elements = { fd00:ec2::254 }
   }
+  chain restricted {
+    ip daddr @metadata_v4 counter reject with icmpx admin-prohibited comment "cloud metadata"
+    ip6 daddr @metadata_v6 counter reject with icmpx admin-prohibited comment "cloud metadata"
+    oifname "br-*" tcp dport { 80, 443 } accept
+    oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"
+    oifname "docker0" tcp dport { 80, 443 } accept
+    oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"
+  }
   chain output {
     type filter hook output priority filter; policy accept;
-    meta skuid @restricted_uids ip daddr @metadata_v4 counter reject with icmpx admin-prohibited comment "cloud metadata"
-    meta skuid @restricted_uids ip6 daddr @metadata_v6 counter reject with icmpx admin-prohibited comment "cloud metadata"
+    meta skuid @restricted_uids jump restricted
+    meta skgid @restricted_gids jump restricted
+    socket cgroupv2 level 1 "user.slice" jump restricted
   }
 }
 EOF
+}
+
+# adk_egress_unit RULES_FILE: adk-egress.service (stdout). Loads the table early at boot; PartOf
+# nftables.service: stopping or restarting nftables (whose /etc/nftables.conf starts with
+# "flush ruleset") stops/restarts it too, and with it the CI runner (BindsTo).
+adk_egress_unit() {
+  cat <<EOF
+[Unit]
+Description=agent-dev-kit egress limits (nftables table inet adk_egress)
+Documentation=file:///opt/adk/docs/agent-vps.md
+DefaultDependencies=no
+After=local-fs.target nftables.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The ruleset matches the cgroup user.slice, resolved at load time: create it if systemd has
+# not yet (early boot); systemd adopts the existing directory.
+ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/user.slice
+ExecStart=/usr/sbin/nft -f $1
+ExecReload=/usr/sbin/nft -f $1
+ExecStop=/usr/sbin/nft delete table inet adk_egress
+
+[Install]
+WantedBy=sysinit.target
+EOF
+}
+
+# adk_nftables_dropin RULES_FILE: drop-in for nftables.service (stdout). Its start and reload
+# run "flush ruleset" (Debian's /etc/nftables.conf), which also removes table adk_egress:
+# load it again right after (ExecReload lines of a drop-in are appended).
+adk_nftables_dropin() {
+  cat <<EOF
+# agent-dev-kit: /etc/nftables.conf flushes the whole ruleset; load the egress limits again
+[Service]
+ExecStartPost=/bin/mkdir -p /sys/fs/cgroup/user.slice
+ExecStartPost=/usr/sbin/nft -f $1
+ExecReload=/usr/sbin/nft -f $1
+EOF
+}
+
+# adk_deny_cron_at USER [ETC]: USER may not use crontab or at (ETC/cron.deny, ETC/at.deny; an
+# existing allow list wins and must not name USER). Existing lines, mode and owner are kept.
+adk_deny_cron_at() {
+  local user="$1" etc="${2:-/etc}" kind allow deny mode owner
+  for kind in cron at; do
+    allow="$etc/$kind.allow" deny="$etc/$kind.deny"
+    if [[ -e "$allow" || -L "$allow" ]]; then
+      [[ -f "$allow" && ! -L "$allow" ]] || adk_die "$allow is not a regular file"
+      if grep -qxF -- "$user" "$allow"; then adk_die "$allow allows $user; remove that line"; fi
+      adk_ok "$allow exists without $user ($kind denied)"
+      continue
+    fi
+    [[ ! -L "$deny" ]] || adk_die "$deny is a symlink; not following it"
+    if [[ -f "$deny" ]] && grep -qxF -- "$user" "$deny"; then
+      adk_ok "$deny: $user"
+      continue
+    fi
+    mode=0644 owner="$(id -un):$(id -gn)"
+    [[ ! -f "$deny" ]] || { mode="0$(stat -c %a "$deny")"; owner="$(stat -c %U:%G "$deny")"; }
+    adk_put_file "$deny" "$mode" "$owner" < <(
+      [[ ! -s "$deny" ]] || { cat "$deny"; [[ -z "$(tail -c 1 "$deny")" ]] || echo; }
+      printf '%s\n' "$user"
+    ) || true
+  done
+}
+
+# _adk_group_has_users GID: 0 if a regular account (uid >= ADK_UID_MIN, or a member name that
+# does not resolve) belongs to group GID, listed in the group database or with GID as its
+# primary group. Root and system accounts (e.g. Debian's user mail in group mail) do not count.
+_adk_group_has_users() {
+  local gid="$1" m uid
+  for m in $(getent group "$gid" | cut -d: -f4 | tr ',' ' '); do
+    uid="$(getent passwd "$m" | cut -d: -f3)"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 0
+    ((uid < ADK_UID_MIN)) || return 0
+  done
+  getent passwd | awk -F: -v g="$gid" -v min="$ADK_UID_MIN" '$4 == g && $3 >= min {f = 1} END {exit !f}'
+}
+
+# adk_dir_chain_trusted DIR: DIR and all its parents are real directories that no
+# unprivileged user can change: owned by a system account (or the caller), group-writable only
+# for a system group without regular users as members (or, for a non-root caller in tests, the
+# caller's own group), other-writable only with the sticky bit
+adk_dir_chain_trusted() {
+  local d="$1" me mygid uid gid mode
+  me="$(id -u)" mygid="$(id -g)"
+  [[ "$d" == /* && "$d" != *//* && "/$d/" != */../* && "/$d/" != */./* ]] || return 1
+  while :; do
+    [[ -d "$d" && ! -L "$d" ]] || return 1
+    read -r uid gid mode < <(stat -c '%u %g %a' "$d")
+    mode=$((8#$mode))
+    ((uid < ADK_UID_MIN || uid == me)) || return 1
+    if (((mode & 8#020) != 0)) && ! ((me != 0 && gid == mygid)); then
+      ((gid < ADK_UID_MIN)) || return 1
+      ! _adk_group_has_users "$gid" || return 1
+    fi
+    (((mode & 8#002) == 0 || (mode & 8#1000) != 0)) || return 1
+    [[ "$d" != / ]] || return 0
+    d="$(dirname "$d")"
+  done
 }

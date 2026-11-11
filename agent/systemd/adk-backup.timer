@@ -1,0 +1,10 @@
+[Unit]
+Description=agent-dev-kit backup, daily before the 04:30 unattended reboot
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

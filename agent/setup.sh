@@ -2,17 +2,24 @@
 # Set up the agent VPS. Runs ON the VPS as root, from /opt/adk (copied by bootstrap.sh).
 # Idempotent: a second run reports only "ok:" lines and "0 changes".
 #
-# Usage: sudo [HERMES_INSTALLER_SHA256=<sha256>] /opt/adk/agent/setup.sh
+# Usage: sudo [HERMES_INSTALLER_SHA256=<sha256>] /opt/adk/agent/setup.sh [--accept-backup-hostkey FP]
 #
 #   HERMES_INSTALLER_SHA256  optional: the Hermes installer must have this sha256
 #                            (its sha256 is always printed to the log)
+#   --accept-backup-hostkey  pin the SSH host key of BACKUP_TARGET with this SHA256
+#                            fingerprint (from the provider, not from a scan alone)
 #
 # Steps: check /opt/adk (root-owned, not writable for others, kit.env 0600), validate
 # kit.env, base packages + unattended-upgrades (reboot 04:30, Debian and Docker CE), swap,
 # Docker CE (pinned apt key, root daemon for the kit's own services, log limits), sshd
 # drop-in, user hermes with rootless Docker, egress limits (nftables: no cloud metadata for
-# hermes), Hermes Agent for hermes. No LLM key is configured: the customer does that.
+# hermes and ci), Hermes Agent for hermes, then the services: Gitea + Caddy (root Docker
+# Compose, /opt/adk/services), Gitea accounts (gitea-init.sh), CI runner as user ci (one job
+# per run, fresh rootless Docker per job, lib/ci-runner.sh), backup timer. No LLM key is configured: the customer does that.
 # Root never reads or writes inside hermes's home; that is done as hermes (lib/host.sh).
+#
+# Lab/test only (environment, not kit.env): ADK_TLS_INTERNAL=1, ADK_RUNNER_ADD_HOST=<ip>,
+# see agent/render-services.sh.
 set -euo pipefail
 export LC_ALL=C
 
@@ -22,8 +29,19 @@ ROOT="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib/host.sh"
 # shellcheck source-path=SCRIPTDIR source=lib/rootless-user.sh
 source "$HERE/lib/rootless-user.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/versions.sh
+source "$HERE/lib/versions.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/gitea-admin.sh
+source "$HERE/lib/gitea-admin.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/ci-runner.sh
+source "$HERE/lib/ci-runner.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/services.sh
+source "$HERE/lib/services.sh"
+# shellcheck source-path=SCRIPTDIR source=../scripts/lib/config.sh
+source "$ROOT/scripts/lib/config.sh"
 
 AGENT_USER=hermes
+CI_USER=ci
 AUTH_KEYS_DIR=/etc/ssh/authorized_keys
 HERMES_INSTALLER=https://hermes-agent.nousresearch.com/install.sh
 HERMES_INSTALLER_SHA256="${HERMES_INSTALLER_SHA256:-}"
@@ -31,9 +49,17 @@ DOCKER_KEY=/etc/apt/keyrings/docker.asc
 DOCKER_KEY_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 EGRESS_RULES=/etc/adk/egress.nft
 EGRESS_UNIT=/etc/systemd/system/adk-egress.service
+NFTABLES_DROPIN=/etc/systemd/system/nftables.service.d/50-adk-egress.conf
 SWAP_FILE=/swapfile
 SWAP_SIZE=2G
 
+ACCEPT_BACKUP_HOSTKEY=""
+while (($#)); do
+  case "$1" in
+    --accept-backup-hostkey) (($# >= 2)) || adk_die "usage: $0 [--accept-backup-hostkey SHA256:...]"; ACCEPT_BACKUP_HOSTKEY="$2"; shift 2 ;;
+    *) echo "usage: $0 [--accept-backup-hostkey SHA256:...]" >&2; exit 2 ;;
+  esac
+done
 [[ "$(id -u)" -eq 0 ]] || adk_die "run as root (sudo $0)"
 
 # The kit runs as root: nobody else may be able to change it, and kit.env stays private.
@@ -55,10 +81,13 @@ HERMES_INSTALLER_SHA256="${HERMES_INSTALLER_SHA256,,}"
 
 echo "== config"
 "$ROOT/scripts/check-config.sh" "$ROOT/kit.env"
+load_config "$ROOT/kit.env"
+[[ -z "${ADK_TLS_INTERNAL:-}" ]] || echo "WARNING: ADK_TLS_INTERNAL=${ADK_TLS_INTERNAL} (lab/test mode, no ACME)"
+[[ -z "${ADK_RUNNER_ADD_HOST:-}" ]] || echo "WARNING: ADK_RUNNER_ADD_HOST=${ADK_RUNNER_ADD_HOST} (lab/test mode)"
 
 echo "== base packages"
 adk_apt_install python3 libatomic1 curl ca-certificates git rsync uidmap \
-  dbus-user-session slirp4netns unattended-upgrades gpg nftables
+  dbus-user-session slirp4netns unattended-upgrades gpg nftables age
 
 echo "== unattended-upgrades"
 # Own files instead of editing package-managed ones; later apt.conf.d files win.
@@ -85,6 +114,15 @@ for unit in apt-daily.timer apt-daily-upgrade.timer; do
     adk_changed "$unit enabled"
   fi
 done
+
+echo "== resolver"
+if systemctl is-enabled --quiet systemd-resolved 2>/dev/null; then
+  if adk_put_file /etc/systemd/resolved.conf.d/50-adk.conf 0644 root:root < <(adk_resolved_conf); then
+    systemctl restart systemd-resolved
+  fi
+else
+  adk_ok "systemd-resolved not in use (no LLMNR listener)"
+fi
 
 echo "== swap"
 if [[ -n "$(swapon --show --noheadings)" ]]; then
@@ -134,7 +172,8 @@ EOF
 then
   apt-get update -q
 fi
-adk_apt_install docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras
+adk_apt_install docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
+  docker-ce-rootless-extras
 # Written after the install (not a package conffile, but the daemon must exist first).
 if adk_put_file /etc/docker/daemon.json 0644 root:root <<'EOF'
 {
@@ -182,33 +221,32 @@ rm -f "$old_dropin"
 echo "== user $AGENT_USER"
 adk_setup_rootless_user "$AGENT_USER"
 
+echo "== user $CI_USER (CI runner)"
+# Only the account here: its rootless Docker is set up fresh before every CI job by the
+# runner unit (agent/ci-reset.sh prepare) and wiped after it; ci-reset.sh also switches its
+# linger and account expiry (off/expired between jobs). No cron or at jobs, ever: they would
+# outlive the wipe.
+adk_ensure_unprivileged_user "$CI_USER" no-linger
+adk_deny_cron_at "$CI_USER"
+
 echo "== egress limits (nftables)"
 # sshd's PermitOpen only limits tunnels; a shell as hermes has open outbound. This table is
-# the boundary for the cloud metadata service (uids: hermes; PR 2b adds ci).
-egress_rules="$(adk_egress_rules "$(id -u "$AGENT_USER")")"
+# the boundary for the cloud metadata service (uids: hermes and ci, incl. CI job containers).
+# uids/gids incl. the subordinate ranges (user namespaces can switch to those), plus all of
+# user.slice as a second layer (adk_egress_rules in lib/host.sh).
+egress_uids="" egress_gids=""
+for u in "$AGENT_USER" "$CI_USER"; do
+  egress_uids+=" $(id -u "$u") $(adk_subid_ranges /etc/subuid "$u" "$(id -u "$u")" | tr '\n' ' ')"
+  egress_gids+=" $(id -g "$u") $(adk_subid_ranges /etc/subgid "$u" "$(id -u "$u")" | tr '\n' ' ')"
+done
+egress_rules="$(adk_egress_rules "$egress_uids" "$egress_gids")"
 egress_reload=false
 adk_put_file "$EGRESS_RULES" 0644 root:root <<< "$egress_rules" && egress_reload=true
-if adk_put_file "$EGRESS_UNIT" 0644 root:root <<EOF
-[Unit]
-Description=agent-dev-kit egress limits (nftables table inet adk_egress)
-Documentation=file:///opt/adk/docs/agent-vps.md
-DefaultDependencies=no
-After=local-fs.target nftables.service
-Before=network-pre.target shutdown.target
-Wants=network-pre.target
-Conflicts=shutdown.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f $EGRESS_RULES
-ExecReload=/usr/sbin/nft -f $EGRESS_RULES
-ExecStop=/usr/sbin/nft delete table inet adk_egress
-
-[Install]
-WantedBy=sysinit.target
-EOF
-then
+egress_units=false
+adk_put_file "$EGRESS_UNIT" 0644 root:root < <(adk_egress_unit "$EGRESS_RULES") && egress_units=true
+# nftables.service flushes the whole ruleset on start/reload: load table adk_egress again then
+adk_put_file "$NFTABLES_DROPIN" 0644 root:root < <(adk_nftables_dropin "$EGRESS_RULES") && egress_units=true
+if [[ "$egress_units" == true ]]; then
   systemctl daemon-reload
   egress_reload=true
 fi
@@ -256,6 +294,29 @@ else
   adk_changed "hermes installed"
 fi
 
+echo "== services (gitea, caddy)"
+adk_secrets_dir
+adk_gitea_secrets
+adk_caddy_env "${CFG[ACME_MODE]}"
+adk_gitea_user
+adk_render_services "$ROOT/kit.env"
+adk_services_up
+adk_lab_ca "$AGENT_USER"
+adk_wait_https "${CFG[GITEA_DOMAIN]}"
+
+init_out="$("$HERE/gitea-init.sh" --config "$ROOT/kit.env")" || { printf '%s\n' "$init_out"; adk_die "gitea-init.sh failed"; }
+printf '%s\n' "$init_out"
+ADK_CHANGES=$((ADK_CHANGES + $(grep -c '^changed:' <<< "$init_out" || true)))
+
+echo "== ci runner"
+adk_runner_binary
+adk_runner_service "${CFG[GITEA_DOMAIN]}"
+
+echo "== backup"
+adk_backup_setup "${CFG[BACKUP_TARGET]}" "${CFG[CUSTOMER_NAME]}" "$ACCEPT_BACKUP_HOSTKEY"
+
 echo
 echo "setup done: $ADK_CHANGES change(s)"
 echo "Next: add the employee's key (from stdin):  sudo $HERE/add-key.sh $AGENT_USER < key.pub"
+echo "Gitea: https://${CFG[GITEA_DOMAIN]}/ - initial password of ${CFG[GITEA_ADMIN_USER]}: /root/adk-gitea-initial-password (if not handed over yet)"
+echo "New repositories: the employee creates them, then: sudo $HERE/protect-repo.sh ${CFG[CUSTOMER_NAME]}/<repo>"

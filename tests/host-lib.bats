@@ -260,36 +260,129 @@ snapshot() {
 
 # --- egress rules (nftables) -------------------------------------------------------
 
-@test "adk_egress_rules blocks the metadata service for the given uids only" {
-  run adk_egress_rules 1000 1001
+@test "adk_egress_rules blocks the metadata service for the given uids, gids and user sessions" {
+  run adk_egress_rules "1000 1001" "1000 1001"
   [ "$status" -eq 0 ]
   [[ "$output" == *"table inet adk_egress"* ]]
   [[ "$output" == *"delete table inet adk_egress"* ]]
-  [[ "$output" == *"elements = { 1000, 1001 }"* ]]
   [[ "$output" == *"169.254.169.254"* ]]
   [[ "$output" == *"fd00:ec2::254"* ]]
   [[ "$output" == *"hook output"* ]]
-  [[ "$output" == *"meta skuid @restricted_uids ip daddr @metadata_v4 counter reject"* ]]
-  [[ "$output" == *"meta skuid @restricted_uids ip6 daddr @metadata_v6 counter reject"* ]]
-  run adk_egress_rules 1000
+  [[ "$output" == *"meta skuid @restricted_uids jump restricted"* ]]
+  [[ "$output" == *"meta skgid @restricted_gids jump restricted"* ]]
+  [[ "$output" == *"ip daddr @metadata_v4 counter reject"* ]]
+  [[ "$output" == *"ip6 daddr @metadata_v6 counter reject"* ]]
+  run adk_egress_rules 1000 1000
   [[ "$output" == *"elements = { 1000 }"* ]]
 }
 
-@test "adk_egress_rules refuses non-numeric or root uids" {
-  run adk_egress_rules hermes
+@test "adk_egress_rules: subordinate id ranges are in the sets (interval sets)" {
+  run adk_egress_rules "1001 1002 100000-165535 165536-231071" "1001 1002 100000-165535 165536-231071"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'flags interval' <<< "$output")" -eq 2 ]
+  [ "$(grep -c 'elements = { 1001, 1002, 100000-165535, 165536-231071 }' <<< "$output")" -eq 2 ]
+  grep -q 'type uid' <<< "$output"
+  grep -q 'type gid' <<< "$output"
+}
+
+@test "adk_egress_rules: second layer by cgroup (all user sessions and user managers)" {
+  run adk_egress_rules 1001 1001
+  [[ "$output" == *'socket cgroupv2 level 1 "user.slice" jump restricted'* ]]
+}
+
+@test "adk_egress_rules keeps the uids away from root Docker containers except ports 80/443" {
+  run adk_egress_rules "1001 1002" "1001"
+  [ "$status" -eq 0 ]
+  # published ports (Caddy) stay reachable, also after Docker's DNAT of the host address
+  [[ "$output" == *'oifname "br-*" tcp dport { 80, 443 } accept'* ]]
+  [[ "$output" == *'oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
+  [[ "$output" == *'oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
+}
+
+@test "adk_egress_rules refuses non-numeric, root or reversed ids" {
+  run adk_egress_rules hermes 1000
   [ "$status" -ne 0 ]
-  run adk_egress_rules 0
+  run adk_egress_rules 0 1000
   [ "$status" -ne 0 ]
-  run adk_egress_rules
+  run adk_egress_rules 1000 0-5
+  [ "$status" -ne 0 ]
+  run adk_egress_rules 200-100 1000
+  [ "$status" -ne 0 ]
+  run adk_egress_rules "" 1000
+  [ "$status" -ne 0 ]
+  run adk_egress_rules 1000
   [ "$status" -ne 0 ]
 }
 
 @test "adk_egress_rules output is accepted by nft (if available)" {
   command -v nft > /dev/null || skip "nft not installed"
-  adk_egress_rules 1000 > "$BATS_TEST_TMPDIR/egress.nft"
+  adk_egress_rules "1000 100000-165535" "1000 100000-165535" > "$BATS_TEST_TMPDIR/egress.nft"
   run nft -c -f "$BATS_TEST_TMPDIR/egress.nft"
   if [[ "$output" == *"Operation not permitted"* || "$output" == *"ermission denied"* ]]; then
     skip "nft -c needs CAP_NET_ADMIN here"
   fi
   [ "$status" -eq 0 ]
+}
+
+@test "adk_resolved_conf: no LLMNR and no mDNS listeners (only 22/443 are open)" {
+  run adk_resolved_conf
+  [ "$status" -eq 0 ]
+  grep -qx '\[Resolve\]' <<< "$output"
+  grep -qx 'LLMNR=no' <<< "$output"
+  grep -qx 'MulticastDNS=no' <<< "$output"
+}
+
+@test "adk_egress_unit: loaded early, reloaded with nftables (PartOf), user.slice created first" {
+  run adk_egress_unit /etc/adk/egress.nft
+  [ "$status" -eq 0 ]
+  grep -qx 'PartOf=nftables.service' <<< "$output"
+  grep -qE '^After=.*nftables.service' <<< "$output"
+  grep -qx 'ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/user.slice' <<< "$output"
+  grep -qx 'ExecStart=/usr/sbin/nft -f /etc/adk/egress.nft' <<< "$output"
+  grep -qx 'ExecStop=/usr/sbin/nft delete table inet adk_egress' <<< "$output"
+  grep -qx 'WantedBy=sysinit.target' <<< "$output"
+}
+
+@test "adk_nftables_dropin: starting or reloading nftables (flush ruleset) loads the egress table again" {
+  run adk_nftables_dropin /etc/adk/egress.nft
+  [ "$status" -eq 0 ]
+  grep -qx '\[Service\]' <<< "$output"
+  [ "$(grep '^ExecStartPost=' <<< "$output")" = "$(printf 'ExecStartPost=/bin/mkdir -p /sys/fs/cgroup/user.slice\nExecStartPost=/usr/sbin/nft -f /etc/adk/egress.nft')" ]
+  grep -qx 'ExecReload=/usr/sbin/nft -f /etc/adk/egress.nft' <<< "$output"
+}
+
+@test "adk_deny_cron_at: the user lands in cron.deny and at.deny, existing lines and modes stay" {
+  E="$BATS_TEST_TMPDIR/etc"
+  mkdir -p "$E"
+  printf 'alice\nbob' > "$E/at.deny"
+  chmod 0640 "$E/at.deny"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$E/at.deny")" = "$(printf 'alice\nbob\nci')" ]
+  [ "$(stat -c %a "$E/at.deny")" = "640" ]
+  [ "$(cat "$E/cron.deny")" = "ci" ]
+  [ "$(stat -c %a "$E/cron.deny")" = "644" ]
+  # second run: nothing to do
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *changed* ]]
+}
+
+@test "adk_deny_cron_at: an allow list naming the user stops setup, one without it is enough" {
+  E="$BATS_TEST_TMPDIR/etc"
+  mkdir -p "$E"
+  printf 'root\n' > "$E/cron.allow"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -eq 0 ]
+  [ ! -e "$E/cron.deny" ]
+  [ "$(cat "$E/at.deny")" = "ci" ]
+  printf 'ci\n' >> "$E/cron.allow"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cron.allow"* ]]
+  ln -s "$BATS_TEST_TMPDIR/file" "$E/at.deny.lnk"
+  rm -f "$E/cron.allow" "$E/at.deny"
+  ln -s "$BATS_TEST_TMPDIR/file" "$E/at.deny"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -ne 0 ]
 }
