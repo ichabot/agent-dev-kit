@@ -124,3 +124,23 @@ need_yaml() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"evil"* ]]
 }
+
+@test "--role test writes the TEST sshd drop-in (deploy user, forced gate)" {
+  run "$RENDER" --pubkey "$KEY.pub" --role test
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"AllowUsers adk-admin deploy"* ]]
+  [[ "$output" == *"ForceCommand /opt/adk/test/deploy-gate.sh"* ]]
+  [[ "$output" != *"PermitOpen 127.0.0.1"* ]]
+  run "$RENDER" --pubkey "$KEY.pub" --role agent
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"AllowUsers adk-admin hermes"* ]]
+  run "$RENDER" --pubkey "$KEY.pub" --role prod
+  [ "$status" -eq 2 ]
+}
+
+@test "--role test output is valid YAML with the drop-in verbatim" {
+  need_yaml
+  run "$RENDER" --pubkey "$KEY.pub" --role test
+  [ "$status" -eq 0 ]
+  [ "$(y '[f["content"] for f in c["write_files"] if f["path"] == "/etc/ssh/sshd_config.d/10-adk.conf"][0]')" = "$(cat "$ROOT/test/sshd-adk-test.conf")" ]
+}
