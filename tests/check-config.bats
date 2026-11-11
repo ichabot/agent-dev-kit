@@ -208,7 +208,7 @@ set_var() {
 }
 
 @test "CUSTOMER_IPS: non-public addresses are rejected" {
-  for n in 127.0.0.1 0.0.0.0 192.168.1.0/24 10.0.0.1 224.0.0.0/24 169.254.1.1 ::1 fe80::1 ::ffff:203.0.113.1 fd00::/48; do
+  for n in 127.0.0.1 0.0.0.0 172.16.0.0/24 10.0.0.1 224.0.0.0/24 169.254.1.1 ::1 fe80::1 ::ffff:203.0.113.1 fd00::/48; do
     set_var CUSTOMER_IPS "$n"
     run "$CHECK" "$CFG"
     [ "$status" -eq 1 ] || { echo "accepted: $n"; return 1; }
