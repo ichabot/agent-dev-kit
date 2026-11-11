@@ -12,8 +12,9 @@
 # Requires: host.sh sourced, packages uidmap dbus-user-session slirp4netns
 # docker-ce-rootless-extras installed.
 
-# Groups that would hand out root (directly or via a root daemon).
-ADK_PRIVILEGED_GROUPS=(sudo docker adm disk lxd libvirt)
+# Groups that would hand out root (directly, via a root daemon, a device, a writable
+# directory early in root's PATH such as /usr/local for staff) or secrets (shadow, logs).
+ADK_PRIVILEGED_GROUPS=(root sudo staff shadow adm systemd-journal disk kvm docker lxd incus-admin libvirt)
 
 adk_ensure_unprivileged_user() {
   local name="$1" g home
@@ -36,7 +37,8 @@ adk_ensure_unprivileged_user() {
   if grep -rqsE "^[^#]*\b$name\b" /etc/sudoers /etc/sudoers.d; then
     adk_die "sudoers mentions $name; remove that entry (the user must not have sudo)"
   fi
-  home="$(getent passwd "$name" | cut -d: -f6)"
+  home="$(adk_user_home "$name")"
+  [[ -d "$home" && ! -L "$home" ]] || adk_die "home of $name ($home) is missing or a symlink"
   if [[ "$(stat -c %a "$home")" != "700" ]]; then
     chmod 0700 "$home"
     adk_changed "$home: mode 0700"
@@ -69,18 +71,20 @@ adk_wait_user_bus() {
 adk_ensure_rootless_docker() {
   local name="$1" uid home
   uid="$(id -u "$name")"
-  home="$(getent passwd "$name" | cut -d: -f6)"
+  home="$(adk_user_home "$name")"
   adk_wait_user_bus "$name"
 
-  if [[ -f "$home/.config/systemd/user/docker.service" ]]; then
+  # Everything inside the home is done as the user (adk_user_*), never as root.
+  if adk_user_test "$name" "$home" -f "$home/.config/systemd/user/docker.service"; then
     adk_ok "rootless docker for $name installed"
   else
     adk_user_env "$name" dockerd-rootless-setuptool.sh install
     adk_changed "rootless docker for $name installed"
   fi
 
-  install -d -m 0700 -o "$name" -g "$name" "$home/.config" "$home/.config/docker"
-  if adk_put_file "$home/.config/docker/daemon.json" 0644 "$name:$name" <<'EOF'
+  adk_user_mkdir "$name" "$home" "$home/.config" 0700 || true
+  adk_user_mkdir "$name" "$home" "$home/.config/docker" 0700 || true
+  if adk_user_put_file "$name" "$home" "$home/.config/docker/daemon.json" 0644 <<'EOF'
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "5" }
@@ -101,10 +105,10 @@ EOF
     adk_ok "rootless docker for $name running"
   fi
 
-  adk_put_block "$home/.profile" "$name:$name" "adk rootless docker" bottom <<EOF
+  adk_user_put_block "$name" "$home" "$home/.profile" "adk rootless docker" bottom <<EOF
 export DOCKER_HOST=unix:///run/user/$uid/docker.sock
 EOF
-  adk_put_block "$home/.bashrc" "$name:$name" "adk rootless docker" top <<EOF
+  adk_user_put_block "$name" "$home" "$home/.bashrc" "adk rootless docker" top <<EOF
 export DOCKER_HOST=unix:///run/user/$uid/docker.sock
 EOF
 }
