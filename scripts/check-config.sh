@@ -85,7 +85,7 @@ fi
 
 # Gitea user and organization names share one namespace; these are taken by Gitea itself or
 # by the kit's own accounts (agent/gitea-init.sh).
-GITEA_RESERVED=(admin root agent-bot prod-pull ghost gitea-actions api assets explore org repo user
+GITEA_RESERVED=(admin root agent-bot prod-pull test-pull ghost gitea-actions api assets explore org repo user
   users v2 login new notifications issues pulls milestones raw search avatars attachments
   avatar captcha commits debug error metrics repo-avatars ssh_info help install)
 is_reserved() {
