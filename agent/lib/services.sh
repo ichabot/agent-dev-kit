@@ -237,11 +237,12 @@ adk_runner_setup() {
   if adk_as_user ci test -f "$ADK_RUNNER_STATE/.runner"; then
     adk_ok "runner registered"
   else
-    # The registration token goes from Gitea's CLI straight into the runner's stdin.
+    # The registration token goes from Gitea's CLI through a pipe into the environment of the
+    # register process (readable only by ci and root), never into argv or a file.
     # shellcheck disable=SC2016  # expanded by the inner sh
     if ! adk_compose exec -T -u git gitea gitea actions generate-runner-token < /dev/null 2>/dev/null \
         | tail -n 1 \
-        | adk_as_user ci env HOME="$ADK_RUNNER_STATE" sh -c 'cd "$1" && exec "$2" -c "$3" register --no-interactive --instance "$4" --name "$5" --token-file /dev/stdin' \
+        | adk_as_user ci env HOME="$ADK_RUNNER_STATE" sh -c 'cd "$1" && IFS= read -r GITEA_RUNNER_REGISTRATION_TOKEN && export GITEA_RUNNER_REGISTRATION_TOKEN && exec "$2" -c "$3" register --no-interactive --instance "$4" --name "$5"' \
           sh "$ADK_RUNNER_STATE" "$ADK_RUNNER_BIN" "$ADK_RUNNER_CONFIG" "https://$domain" "adk-$customer"; then
       adk_die "runner registration failed"
     fi
