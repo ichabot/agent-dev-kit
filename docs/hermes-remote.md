@@ -42,7 +42,8 @@ Hermes instance on the agent VPS.
 - Employee's public key in a **root-owned** key file, so the agent cannot add its own keys
   and keep access after handover.
 - No systemd unit for `hermes serve` needed; Desktop starts and stops it.
-- sshd drop-in (`/etc/ssh/sshd_config.d/10-adk.conf`), verified with `sshd -T -C user=<hermes-user>`:
+- sshd drop-in (`/etc/ssh/sshd_config.d/10-adk.conf`, the kit's copy is
+  `agent/sshd-adk.conf`), verified with `sshd -T -C user=<hermes-user>`:
 
 ```
 PasswordAuthentication no
@@ -50,15 +51,27 @@ KbdInteractiveAuthentication no
 PermitRootLogin no
 AuthorizedKeysFile /etc/ssh/authorized_keys/%u
 AllowTcpForwarding no
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+PermitTunnel no
 X11Forwarding no
 AllowUsers <hermes-user> <admin-user>
 
-# Desktop needs local forwarding to the loopback backend only; this blocks tunnels into
-# Docker networks or the cloud metadata service.
+# Desktop needs local forwarding to the loopback backend only (defense in depth).
 Match User <hermes-user>
     AllowTcpForwarding local
     PermitOpen 127.0.0.1:*
+
+Match all
+    X11Forwarding no
+    AllowAgentForwarding no
+    AllowStreamLocalForwarding no
+    PermitTunnel no
 ```
+
+`PermitOpen` is defense in depth, not a boundary: a shell as the Hermes user has open
+outbound anyway. The cloud metadata service is blocked for that user by nftables
+(`adk-egress.service`, see `docs/agent-vps.md`).
 
 `/etc/ssh/authorized_keys/` is `root:root 0755`, each file `root:root 0644`.
 Debian 13: apply with `systemctl restart ssh` (`reload` failed in the test container).

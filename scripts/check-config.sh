@@ -15,9 +15,7 @@ source "$HERE/lib/config.sh"
 
 # Keys that may stay empty (further rules below can still require them).
 OPTIONAL=(DNS_PROVIDER BACKUP_TARGET)
-# Narrowest allowed firewall source prefixes: a typo must not open the VPS to the world.
-MIN_PREFIX_V4=24
-MIN_PREFIX_V6=48
+# Firewall source rules (public only, minimum prefix) live in lib/cidr.py.
 
 usage() { echo "usage: $0 [FILE] | --list-keys" >&2; exit 2; }
 
@@ -85,36 +83,9 @@ fi
 
 v="$(val CUSTOMER_IPS)"
 if [[ -n "$v" ]]; then
-  # One isolated interpreter call (-I: no cwd on sys.path, no user site, no PYTHON* env).
-  # Prints one "network: reason" line per rejected entry, or "EMPTY".
-  if ! ip_errors="$(python3 -I - "$v" "$MIN_PREFIX_V4" "$MIN_PREFIX_V6" <<'PY'
-import ipaddress, sys
-
-raw, min4, min6 = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-# Documentation ranges are unroutable and used by the tests; everything else must be global.
-doc = [ipaddress.ip_network(n) for n in
-       ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")]
-entries = [e.strip() for e in raw.split(",") if e.strip()]
-if not entries:
-    print("EMPTY")
-for e in entries:
-    try:
-        net = ipaddress.ip_network(e, strict=True)
-    except ValueError as ex:
-        print(f"{e}: {'host bits set (prefix typo?)' if 'host bits' in str(ex) else 'not a network'}")
-        continue
-    if net.version == 6 and net.network_address.ipv4_mapped is not None:
-        print(f"{e}: IPv4-mapped IPv6 is not allowed")
-        continue
-    if net.prefixlen < (min4 if net.version == 4 else min6):
-        print(f"{e}: too broad (minimum /{min4 if net.version == 4 else min6})")
-        continue
-    if any(net.subnet_of(d) for d in doc if d.version == net.version):
-        continue
-    if not net.is_global or net.is_multicast:
-        print(f"{e}: not a public address")
-PY
-  )"; then
+  # Shared rules (scripts/lib/cidr.py), isolated interpreter (-I: no cwd or script dir on
+  # sys.path, no user site, no PYTHON* env). One "network: reason" line per rejected entry.
+  if ! ip_errors="$(python3 -I "$HERE/lib/cidr.py" check "$v")"; then
     err CUSTOMER_IPS "validation failed (python3 error)"
   fi
   while IFS= read -r line; do

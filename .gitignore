@@ -3,3 +3,4 @@ kit.env
 *.pem
 .env
 !.env.example
+__pycache__/
