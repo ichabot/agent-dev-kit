@@ -325,7 +325,13 @@ adk_backup_setup() {
   fi
   adk_put_file /etc/systemd/system/adk-backup.service 0644 root:root < "$here/systemd/adk-backup.service" && unit_changed=true
   adk_put_file /etc/systemd/system/adk-backup.timer 0644 root:root < "$here/systemd/adk-backup.timer" && unit_changed=true
+  adk_put_file /etc/systemd/system/adk-backup-recover.service 0644 root:root < "$here/systemd/adk-backup-recover.service" && unit_changed=true
   [[ "$unit_changed" == false ]] || systemctl daemon-reload
+  # at boot: Gitea runs again even after a crash or power loss in the middle of a dump
+  if [[ "$(systemctl is-enabled adk-backup-recover.service 2>/dev/null)" != enabled ]]; then
+    systemctl enable adk-backup-recover.service > /dev/null 2>&1
+    adk_changed "adk-backup-recover.service enabled (starts Gitea at boot if a backup had stopped it)"
+  fi
   if [[ "$(systemctl is-enabled adk-backup.timer 2>/dev/null)" != enabled ]] || ! systemctl is-active --quiet adk-backup.timer; then
     systemctl enable --now adk-backup.timer
     adk_changed "adk-backup.timer enabled (daily 03:30)"

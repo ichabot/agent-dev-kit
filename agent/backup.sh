@@ -10,8 +10,9 @@
 #                       while the service is down (no pushes or jobs during the dump; at most
 #                       2 hours); Gitea is started again afterwards in any case: by this script,
 #                       and if it is killed (or the server shuts down meanwhile) by
-#                       --ensure-gitea, which adk-backup.service runs as ExecStopPost (a marker
-#                       file records that the backup stopped Gitea)
+#                       --ensure-gitea, which adk-backup.service runs as ExecStopPost and
+#                       adk-backup-recover.service at boot (a marker file records that the
+#                       backup stopped Gitea)
 #   adk-secrets.tar     /opt/adk/secrets and /opt/adk/kit.env
 #   hermes-home.tar.gz  home of hermes, packed AS hermes (tar never follows symlinks; root never
 #                       reads in that home); without caches (.cache, node_modules), the rootless

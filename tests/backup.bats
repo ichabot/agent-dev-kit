@@ -309,7 +309,12 @@ offsite_config() {
   [ ! -e "$ADK_BACKUP_DIR/.gitea-stopped-by-backup" ]
 }
 
-@test "adk-backup.service: --ensure-gitea after every run, bounded run time" {
+@test "adk-backup.service: --ensure-gitea after every run and at boot, bounded run time" {
   grep -qx 'ExecStopPost=/opt/adk/agent/backup.sh --ensure-gitea' "$ROOT/agent/systemd/adk-backup.service"
   grep -qE '^TimeoutStartSec=[0-9]+h$' "$ROOT/agent/systemd/adk-backup.service"
+  # crash or power loss during a dump: the next boot starts Gitea again
+  grep -qx 'ExecStart=/opt/adk/agent/backup.sh --ensure-gitea' "$ROOT/agent/systemd/adk-backup-recover.service"
+  grep -qx 'WantedBy=multi-user.target' "$ROOT/agent/systemd/adk-backup-recover.service"
+  grep -qE '^After=.*docker.service' "$ROOT/agent/systemd/adk-backup-recover.service"
+  grep -q 'adk-backup-recover.service' "$ROOT/agent/lib/services.sh"
 }
