@@ -277,10 +277,36 @@ adk_runner_service() {
   fi
 }
 
-# adk_backup_setup TARGET CUSTOMER: local backup directory, daily timer (03:30, before the
-# 04:30 unattended reboot), and for an off-site TARGET a dedicated SSH key (public part shown).
+# adk_hostkey_matching FINGERPRINT < ssh-keyscan output: the scanned host key lines whose
+# SHA256 fingerprint is FINGERPRINT (comments and other keys dropped)
+adk_hostkey_matching() {
+  local want="$1" line fp
+  while IFS= read -r line; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    fp="$(ssh-keygen -l -E sha256 -f - <<< "$line" 2>/dev/null | awk '{print $2}')" || continue
+    [[ "$fp" == "$want" ]] && printf '%s\n' "$line"
+  done
+  return 0
+}
+
+# adk_backup_target_parts TARGET: "user@host port path" of sftp://user@host[:port]/path
+adk_backup_target_parts() {
+  local rest="${1#sftp://}" userhost path port=22
+  userhost="${rest%%/*}"
+  path="/${rest#*/}"
+  [[ "$rest" == */* ]] || path="."
+  if [[ "$userhost" == *:* ]]; then port="${userhost##*:}"; userhost="${userhost%:*}"; fi
+  printf '%s %s %s\n' "$userhost" "$port" "$path"
+}
+
+# adk_backup_setup TARGET CUSTOMER [ACCEPT_FINGERPRINT]: local backup directory, daily timer
+# (03:30, before the 04:30 unattended reboot), the MANIFEST signing key (always: restore.sh
+# verifies every backup), and for an off-site TARGET a dedicated SSH key (public part shown)
+# and the target's host key, pinned only when the admin confirms its fingerprint
+# (setup.sh --accept-backup-hostkey SHA256:...; compare with the provider's published value).
 adk_backup_setup() {
-  local target="$1" customer="$2" here unit_changed=false
+  local target="$1" customer="$2" accept="${3:-}" here unit_changed=false sign=/root/.ssh/adk-backup-sign \
+    signers=/etc/adk/backup-allowed-signers kh=/root/.ssh/adk-backup.known_hosts userhost port path host scanned pinned
   here="$_ADK_HOST_LIB/.."
   if [[ "$(stat -c '%a %U:%G' /var/backups/adk 2>/dev/null)" != "700 root:root" ]]; then
     install -d -m 0700 -o root -g root /var/backups/adk
@@ -297,8 +323,20 @@ adk_backup_setup() {
   else
     adk_ok "adk-backup.timer (daily 03:30)"
   fi
-  [[ -n "$target" ]] || return 0
   install -d -m 0700 -o root -g root /root/.ssh
+  # signing key for MANIFEST (root only); its public key goes offline with the age key
+  if [[ -f "$sign" && -f "$sign.pub" && ! -L "$sign" ]]; then
+    adk_ok "backup signing key $sign"
+  else
+    [[ ! -L "$sign" ]] || adk_die "$sign is a symlink"
+    rm -f "$sign" "$sign.pub"
+    ssh-keygen -q -t ed25519 -N '' -C "adk-backup-sign@$customer" -f "$sign"
+    adk_changed "backup signing key $sign created"
+    echo "Backup signing public key (keep a copy offline with the age key; restore.sh --signer needs it on a new server):"
+    cat "$sign.pub"
+  fi
+  adk_put_file "$signers" 0644 root:root <<< "adk-backup $(cut -d' ' -f1,2 "$sign.pub")" || true
+  [[ -n "$target" ]] || { [[ -z "$accept" ]] || adk_die "--accept-backup-hostkey needs BACKUP_TARGET in kit.env"; return 0; }
   if [[ -f /root/.ssh/adk-backup && -f /root/.ssh/adk-backup.pub ]]; then
     adk_ok "backup key /root/.ssh/adk-backup (public: /root/.ssh/adk-backup.pub)"
   else
@@ -308,5 +346,23 @@ adk_backup_setup() {
     adk_changed "backup key /root/.ssh/adk-backup created"
     echo "Off-site backup: add this PUBLIC key to the authorized keys of ${target#sftp://} (private key stays on this server):"
     cat /root/.ssh/adk-backup.pub
+  fi
+  read -r userhost port path <<< "$(adk_backup_target_parts "$target")"
+  host="${userhost#*@}"
+  [[ ! -L "$kh" ]] || adk_die "$kh is a symlink"
+  if [[ -n "$accept" ]]; then
+    [[ "$accept" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || adk_die "--accept-backup-hostkey expects a SHA256 fingerprint (SHA256:...)"
+    scanned="$(ssh-keyscan -T 10 -p "$port" "$host" 2>/dev/null || true)"
+    pinned="$(adk_hostkey_matching "$accept" <<< "$scanned")"
+    [[ -n "$pinned" ]] || adk_die "no host key of $host:$port has the fingerprint $accept (scanned: $(ssh-keygen -l -E sha256 -f - <<< "$scanned" 2>/dev/null | awk '{print $2, $NF}' | tr '\n' ' '))"
+    adk_put_file "$kh" 0600 root:root <<< "$pinned" || true
+  fi
+  if [[ -s "$kh" ]]; then
+    adk_ok "backup target host key pinned ($(ssh-keygen -l -E sha256 -f "$kh" | awk '{print $2}' | tr '\n' ' '))"
+  else
+    echo "WARNING: the host key of the backup target $host:$port is not pinned yet; off-site copies fail until it is."
+    echo "  Scanned fingerprints (compare with the value the provider publishes, never trust the scan alone):"
+    ssh-keyscan -T 10 -p "$port" "$host" 2>/dev/null | ssh-keygen -l -E sha256 -f - 2>/dev/null | sed 's/^/    /' || true
+    echo "  Then: sudo /opt/adk/agent/setup.sh --accept-backup-hostkey SHA256:<fingerprint>"
   fi
 }

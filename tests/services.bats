@@ -70,3 +70,21 @@ setup() {
   [ "$(adk_services_action 'caddy gitea ' false true false)" = "restart-caddy" ]
   [ "$(adk_services_action 'caddy gitea ' false false false)" = "none" ]
 }
+
+@test "host key pinning keeps only the scanned key with the confirmed fingerprint" {
+  ssh-keygen -q -t ed25519 -N '' -f "$BATS_TEST_TMPDIR/hk1"
+  ssh-keygen -q -t ecdsa -N '' -f "$BATS_TEST_TMPDIR/hk2"
+  scan="$(printf '# box:23 SSH-2.0\n[box.example.com]:23 %s\n[box.example.com]:23 %s\n' \
+    "$(cut -d' ' -f1,2 "$BATS_TEST_TMPDIR/hk1.pub")" "$(cut -d' ' -f1,2 "$BATS_TEST_TMPDIR/hk2.pub")")"
+  fp="$(ssh-keygen -l -E sha256 -f "$BATS_TEST_TMPDIR/hk2.pub" | awk '{print $2}')"
+  run adk_hostkey_matching "$fp" <<< "$scan"
+  [ "$status" -eq 0 ]
+  [ "$output" = "[box.example.com]:23 $(cut -d' ' -f1,2 "$BATS_TEST_TMPDIR/hk2.pub")" ]
+  run adk_hostkey_matching "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" <<< "$scan"
+  [ -z "$output" ]
+}
+
+@test "backup target parts: user@host, port (default 22) and path" {
+  [ "$(adk_backup_target_parts sftp://u1@box.example.com:23/backups/adk)" = "u1@box.example.com 23 /backups/adk" ]
+  [ "$(adk_backup_target_parts sftp://u1@box.example.com)" = "u1@box.example.com 22 ." ]
+}

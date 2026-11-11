@@ -1,92 +1,212 @@
 #!/usr/bin/env bats
-# Tests for agent/restore.sh argument and backup checks (no Docker, no root needed: the
-# script stops before the first change when the checks fail or --yes is missing).
+# Tests for agent/restore.sh: signature, checksums, archive contents, encrypted parts (no
+# Docker, no root needed: the script stops before the first change when a check fails or
+# --yes is missing).
 
 setup() {
   ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
   RESTORE="$ROOT/agent/restore.sh"
-  B="$BATS_TEST_TMPDIR/20260101T033000Z"
-  mkdir -p "$B"
-  printf 'dump\n' | gzip > "$B/gitea-dump.tar.gz"
-  printf 'secrets\n' > "$B/adk-secrets.tar"
-  printf 'home\n' > "$B/hermes-home.tar"
-  (cd "$B" && sha256sum -- *.tar* > MANIFEST)
-  mkdir -p "$BATS_TEST_TMPDIR/bin"
-  printf '#!/bin/sh\necho "docker $*" >> "%s/docker.log"\nexit 99\n' "$BATS_TEST_TMPDIR" > "$BATS_TEST_TMPDIR/bin/docker"
-  chmod +x "$BATS_TEST_TMPDIR/bin/docker"
-  export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  T="$BATS_TEST_TMPDIR"
+  B="$T/20260101T033000Z"
+  mkdir -p "$B" "$T/src/data" "$T/src/repos/acme/demo.git" "$T/src/secrets"
+  printf 'CREATE TABLE t (x);\n' > "$T/src/gitea-db.sql"
+  printf 'ref: refs/heads/main\n' > "$T/src/repos/acme/demo.git/HEAD"
+  tar -C "$T/src" -czf "$B/gitea-dump.tar.gz" gitea-db.sql data repos
+  printf 'k\n' > "$T/src/secrets/gitea-secret-key"
+  printf 'CUSTOMER_NAME=acme\n' > "$T/src/kit.env"
+  tar -C "$T/src" -cf "$B/adk-secrets.tar" secrets kit.env
+  printf 'home\n' | gzip > "$B/hermes-home.tar.gz"
+  ssh-keygen -q -t ed25519 -N '' -C adk-backup-sign -f "$T/sign"
+  manifest
+  mkdir -p "$T/bin"
+  printf '#!/bin/sh\necho "docker $*" >> "%s/docker.log"\nexit 99\n' "$T" > "$T/bin/docker"
+  chmod +x "$T/bin/docker"
+  export PATH="$T/bin:$PATH"
 }
 
-no_docker() { [ ! -e "$BATS_TEST_TMPDIR/docker.log" ]; }
+# manifest: (re)write and sign MANIFEST like backup.sh
+manifest() {
+  (cd "$B" && sha256sum -- *.tar* > MANIFEST)
+  sign
+}
+sign() {
+  rm -f "$B/MANIFEST.sig"
+  ssh-keygen -q -Y sign -f "$T/sign" -n adk-backup "$B/MANIFEST" > /dev/null 2>&1
+}
+
+r() { "$RESTORE" --signer "$T/sign.pub" "$@"; }
+
+no_docker() { [ ! -e "$T/docker.log" ]; }
+
+refute() {
+  if "$@"; then return 1; fi
+}
 
 @test "usage errors exit 2" {
   run "$RESTORE"
   [ "$status" -eq 2 ]
-  run "$RESTORE" --bogus "$B"
+  run r --bogus "$B"
   [ "$status" -eq 2 ]
-  run "$RESTORE" --yes "$B" "$B"
+  run r --yes "$B" "$B"
   [ "$status" -eq 2 ]
-  run "$RESTORE" --yes "$BATS_TEST_TMPDIR/missing"
+  run r --yes "$T/missing"
+  [ "$status" -eq 2 ]
+  run "$RESTORE" --signer
   [ "$status" -eq 2 ]
   no_docker
 }
 
 @test "a symlinked backup directory is refused" {
-  ln -s "$B" "$BATS_TEST_TMPDIR/link"
-  run "$RESTORE" --yes "$BATS_TEST_TMPDIR/link"
+  ln -s "$B" "$T/link"
+  run r --yes "$T/link"
   [ "$status" -eq 2 ]
 }
 
-@test "without --yes: checksums are verified, nothing is changed" {
-  run "$RESTORE" "$B"
+@test "without --yes: signature and checksums are verified, nothing is changed" {
+  run r "$B"
   [ "$status" -eq 2 ]
+  [[ "$output" == *"MANIFEST signature ok"* ]]
   [[ "$output" == *"checksums ok (gitea-dump)"* ]]
   [[ "$output" == *"--yes"* ]]
   no_docker
 }
 
 @test "all parts can be selected" {
-  run "$RESTORE" --gitea --secrets --hermes-home "$B"
+  run r --gitea --secrets --hermes-home "$B"
   [ "$status" -eq 2 ]
   [[ "$output" == *"checksums ok (gitea-dump adk-secrets hermes-home)"* ]]
 }
 
-@test "missing MANIFEST is refused" {
+@test "missing MANIFEST or signature is refused" {
+  rm "$B/MANIFEST.sig"
+  run r --yes "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not signed"* ]]
   rm "$B/MANIFEST"
-  run "$RESTORE" --yes "$B"
+  run r --yes "$B"
   [ "$status" -eq 1 ]
   [[ "$output" == *"MANIFEST"* ]]
   no_docker
 }
 
+@test "a MANIFEST signed by another key or changed after signing is refused" {
+  ssh-keygen -q -t ed25519 -N '' -f "$T/other"
+  run "$RESTORE" --signer "$T/other.pub" "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"does not verify"* ]]
+  # attacker replaces an archive and fixes up the (unsigned) checksum
+  printf 'evil\n' | gzip > "$B/hermes-home.tar.gz"
+  (cd "$B" && sha256sum -- *.tar* > MANIFEST)
+  run r --hermes-home "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"does not verify"* ]]
+  no_docker
+}
+
+@test "an allowed-signers file works as --signer too" {
+  printf 'adk-backup %s\n' "$(cut -d' ' -f1,2 "$T/sign.pub")" > "$T/allowed"
+  run "$RESTORE" --signer "$T/allowed" "$B"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"signature ok"* ]]
+}
+
 @test "a modified archive is refused" {
   printf 'tampered\n' | gzip > "$B/gitea-dump.tar.gz"
-  run "$RESTORE" --yes "$B"
+  run r --yes "$B"
   [ "$status" -eq 1 ]
   [[ "$output" == *"sha256"* ]]
   no_docker
 }
 
-@test "a part listed in FAILED is refused, other parts are allowed" {
-  printf 'gitea-dump: gitea dump failed\n' > "$B/FAILED"
-  run "$RESTORE" --yes "$B"
+@test "a part marked FAILED (in the signed MANIFEST or in FAILED) is refused, other parts are allowed" {
+  printf 'FAILED gitea-dump\n' >> "$B/MANIFEST"
+  sign
+  run r --yes "$B"
   [ "$status" -eq 1 ]
   [[ "$output" == *"failed in this backup"* ]]
-  run "$RESTORE" --hermes-home "$B"
+  run r --hermes-home "$B"
   [ "$status" -eq 2 ]
   [[ "$output" == *"checksums ok (hermes-home)"* ]]
+  manifest
+  printf 'gitea-dump: gitea dump failed\n' > "$B/FAILED"
+  run r --yes "$B"
+  [ "$status" -eq 1 ]
 }
 
 @test "a missing part is refused" {
-  rm "$B/hermes-home.tar"
-  run "$RESTORE" --hermes-home --yes "$B"
+  rm "$B/hermes-home.tar.gz"
+  run r --hermes-home --yes "$B"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"hermes-home.tar is missing"* ]]
+  [[ "$output" == *"hermes-home.tar.gz is missing"* ]]
+}
+
+@test "secrets archive: symlinks and unexpected paths are refused (listing not cut short)" {
+  ln -s /etc/shadow "$T/src/secrets/evil"
+  tar -C "$T/src" -cf "$B/adk-secrets.tar" secrets kit.env
+  manifest
+  run r --secrets "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"links or special files"* ]]
+  rm "$T/src/secrets/evil"
+  # many good entries first, the bad one last: no SIGPIPE shortcut skips it
+  for i in $(seq 1 300); do printf 'x\n' > "$T/src/secrets/s$i"; done
+  mkdir -p "$T/src/etc/cron.d"; printf 'x\n' > "$T/src/etc/cron.d/evil"
+  tar -C "$T/src" -cf "$B/adk-secrets.tar" secrets kit.env etc/cron.d/evil
+  manifest
+  run r --secrets "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unexpected paths"* ]]
+  no_docker
+}
+
+@test "gitea dump with a symlink (e.g. conf/app.ini -> /etc/cron.d/x) is refused before anything runs" {
+  mkdir -p "$T/src/data/conf"
+  ln -s /etc/cron.d/evil "$T/src/data/conf/app.ini"
+  tar -C "$T/src" -czf "$B/gitea-dump.tar.gz" gitea-db.sql data repos
+  manifest
+  run r --yes "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"links or special files"* ]]
+  no_docker
+}
+
+@test "gitea dump with a .. path is refused" {
+  printf 'x\n' > "$T/x"
+  tar -C "$T/src" -P -czf "$B/gitea-dump.tar.gz" gitea-db.sql "../x"
+  tar -tzf "$B/gitea-dump.tar.gz" | grep -qx '\.\./x'
+  manifest
+  run r "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unexpected paths"* ]]
+  no_docker
+}
+
+@test "gitea dump with an absolute path is refused" {
+  tar -C "$T/src" -P -czf "$B/gitea-dump.tar.gz" gitea-db.sql "$T/src/kit.env"
+  manifest
+  run r "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unexpected paths"* ]]
+  no_docker
+}
+
+@test "encrypted off-site copy: needs --age-identity, then verifies like a local backup" {
+  command -v age > /dev/null || skip "age not installed"
+  age-keygen -o "$T/age.key" 2> /dev/null
+  for f in "$B"/*.tar*; do age -r "$(age-keygen -y "$T/age.key")" -o "$f.age" "$f" && rm "$f"; done
+  run r --gitea --secrets --hermes-home "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--age-identity"* ]]
+  run r --gitea --secrets --hermes-home --age-identity "$T/age.key" "$B"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"checksums ok (gitea-dump adk-secrets hermes-home)"* ]]
+  # nothing decrypted next to the backup
+  [ -z "$(find "$B" -name '*.tar' -o -name '*.tar.gz')" ]
 }
 
 @test "as non-root the restore stops after the checks" {
   [ "$(id -u)" -ne 0 ] || skip "runs as root"
-  run "$RESTORE" --yes "$B"
+  run r --yes "$B"
   [ "$status" -eq 1 ]
   [[ "$output" == *"run as root"* ]]
   no_docker

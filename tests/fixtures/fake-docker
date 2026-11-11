@@ -35,15 +35,32 @@ if args == ["init"]:
     save({"users": {}, "tokens": [], "orgs": {}, "teams": {}, "repos": {}, "next_id": 1, "api_calls": 0})
     sys.exit(0)
 
-# docker compose -f F exec -T -u git gitea CMD...
-if args[:1] != ["compose"] or "exec" not in args:
+# docker compose -f F [--project-directory D] exec|run [opts] gitea CMD...  /  stop|start|up ...
+if args[:1] != ["compose"]:
     print("fake docker: unsupported call: " + " ".join(args), file=sys.stderr)
     sys.exit(99)
-i = args.index("exec") + 1
+i = 1
+while args[i] in ("-f", "--project-directory"):
+    i += 2
+sub = args[i]
+if sub in ("stop", "start", "up"):
+    log("compose " + " ".join(args[i:]))
+    if sub == "stop" and os.environ.get("FAKE_STOP_FAIL"):
+        sys.exit(1)
+    sys.exit(0)
+if sub not in ("exec", "run"):
+    print("fake docker: unsupported compose call: " + " ".join(args), file=sys.stderr)
+    sys.exit(99)
+i += 1
 while args[i].startswith("-"):
     i += 2 if args[i] in ("-u", "--user", "-w", "-e") else 1
 service, cmd = args[i], args[i + 1:]
 assert service == "gitea", service
+if sub == "run":
+    # one-off container: the entrypoint switches to git with su-exec
+    assert cmd[:2] == ["su-exec", "git"], cmd
+    cmd = cmd[2:]
+    log("run (one-off container)")
 s = load()
 masked = " ".join("<token>" if re.fullmatch(r"[0-9a-f]{40}", a) else a for a in cmd)
 log(masked)

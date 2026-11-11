@@ -2,10 +2,12 @@
 # Set up the agent VPS. Runs ON the VPS as root, from /opt/adk (copied by bootstrap.sh).
 # Idempotent: a second run reports only "ok:" lines and "0 changes".
 #
-# Usage: sudo [HERMES_INSTALLER_SHA256=<sha256>] /opt/adk/agent/setup.sh
+# Usage: sudo [HERMES_INSTALLER_SHA256=<sha256>] /opt/adk/agent/setup.sh [--accept-backup-hostkey FP]
 #
 #   HERMES_INSTALLER_SHA256  optional: the Hermes installer must have this sha256
 #                            (its sha256 is always printed to the log)
+#   --accept-backup-hostkey  pin the SSH host key of BACKUP_TARGET with this SHA256
+#                            fingerprint (from the provider, not from a scan alone)
 #
 # Steps: check /opt/adk (root-owned, not writable for others, kit.env 0600), validate
 # kit.env, base packages + unattended-upgrades (reboot 04:30, Debian and Docker CE), swap,
@@ -50,6 +52,13 @@ EGRESS_UNIT=/etc/systemd/system/adk-egress.service
 SWAP_FILE=/swapfile
 SWAP_SIZE=2G
 
+ACCEPT_BACKUP_HOSTKEY=""
+while (($#)); do
+  case "$1" in
+    --accept-backup-hostkey) (($# >= 2)) || adk_die "usage: $0 [--accept-backup-hostkey SHA256:...]"; ACCEPT_BACKUP_HOSTKEY="$2"; shift 2 ;;
+    *) echo "usage: $0 [--accept-backup-hostkey SHA256:...]" >&2; exit 2 ;;
+  esac
+done
 [[ "$(id -u)" -eq 0 ]] || adk_die "run as root (sudo $0)"
 
 # The kit runs as root: nobody else may be able to change it, and kit.env stays private.
@@ -77,7 +86,7 @@ load_config "$ROOT/kit.env"
 
 echo "== base packages"
 adk_apt_install python3 libatomic1 curl ca-certificates git rsync uidmap \
-  dbus-user-session slirp4netns unattended-upgrades gpg nftables
+  dbus-user-session slirp4netns unattended-upgrades gpg nftables age
 
 echo "== unattended-upgrades"
 # Own files instead of editing package-managed ones; later apt.conf.d files win.
@@ -310,9 +319,10 @@ adk_runner_binary
 adk_runner_service "${CFG[GITEA_DOMAIN]}"
 
 echo "== backup"
-adk_backup_setup "${CFG[BACKUP_TARGET]}" "${CFG[CUSTOMER_NAME]}"
+adk_backup_setup "${CFG[BACKUP_TARGET]}" "${CFG[CUSTOMER_NAME]}" "$ACCEPT_BACKUP_HOSTKEY"
 
 echo
 echo "setup done: $ADK_CHANGES change(s)"
 echo "Next: add the employee's key (from stdin):  sudo $HERE/add-key.sh $AGENT_USER < key.pub"
 echo "Gitea: https://${CFG[GITEA_DOMAIN]}/ - initial password of ${CFG[GITEA_ADMIN_USER]}: /root/adk-gitea-initial-password (if not handed over yet)"
+echo "New repositories: the employee creates them, then: sudo $HERE/protect-repo.sh ${CFG[CUSTOMER_NAME]}/<repo>"
