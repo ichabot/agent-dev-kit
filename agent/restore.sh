@@ -2,7 +2,7 @@
 # Restore the agent VPS from a backup directory written by agent/backup.sh. Runs as root.
 #
 # Usage: sudo /opt/adk/agent/restore.sh [--gitea] [--secrets] [--hermes-home]
-#          [--signer FILE] [--age-identity FILE] --yes <backup-dir>
+#          [--signer FILE] [--age-identity FILE] [--config FILE] --yes <backup-dir>
 #
 #   --gitea           Gitea from gitea-dump.tar.gz (default when no part is named): stop Gitea,
 #                     keep the current data as /var/lib/adk/gitea.before-restore-<time>,
@@ -16,12 +16,19 @@
 #                     server use the copy the customer keeps offline.
 #   --age-identity F  age private key for an off-site copy (*.age files); decrypted into a
 #                     temporary root-only directory, never next to the backup
+#   --config FILE     kit.env whose CUSTOMER_NAME names this server (default /opt/adk/kit.env;
+#                     without it the server name in the backup is only shown)
 #   --yes             required: the restore replaces current data
 #
-# Checks before anything is changed: MANIFEST.sig is a valid signature of MANIFEST (namespace
-# adk-backup), every chosen file matches its sha256 in MANIFEST, no chosen part is marked
-# FAILED, and the archives contain only regular files and directories at expected paths (no
-# symlinks, hard links or devices: a tampered dump must not make root write elsewhere).
+# A backup directory that an unprivileged user could change (owner, write permission of it, its
+# files or a parent directory) is first copied into a temporary root-only directory; only the
+# copies are verified and used. Checks before anything is changed: MANIFEST.sig is a valid
+# signature of MANIFEST (namespace adk-backup); its first line "backup <timestamp> <server>"
+# matches the directory name (an older backup renamed to a newer name is refused) and this
+# server, the age of the backup is shown; every chosen file (and an .age ciphertext BEFORE it
+# is decrypted) matches its sha256 in MANIFEST, no chosen part is marked FAILED, and the
+# archives contain only regular files and directories at expected paths (no symlinks, hard
+# links or devices: a tampered dump must not make root write elsewhere).
 # Exit codes: 0 = restored, 1 = failure, 2 = usage.
 set -euo pipefail
 export LC_ALL=C
@@ -30,6 +37,8 @@ umask 077
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=lib/host.sh
 source "$HERE/lib/host.sh"
+# shellcheck source-path=SCRIPTDIR source=../scripts/lib/config.sh
+source "$HERE/../scripts/lib/config.sh"
 
 AGENT_USER=hermes
 COMPOSE_FILE=/opt/adk/services/compose.yaml
@@ -39,11 +48,12 @@ KIT_DIR=/opt/adk
 SIGN_NAMESPACE=adk-backup
 
 usage() {
-  echo "usage: $0 [--gitea] [--secrets] [--hermes-home] [--signer FILE] [--age-identity FILE] --yes <backup-dir>" >&2
+  echo "usage: $0 [--gitea] [--secrets] [--hermes-home] [--signer FILE] [--age-identity FILE] [--config FILE] --yes <backup-dir>" >&2
   exit 2
 }
 
 DO_GITEA=false DO_SECRETS=false DO_HOME=false YES=false DIR="" SIGNER=/etc/adk/backup-allowed-signers IDENTITY=""
+CONFIG="$KIT_DIR/kit.env"
 while (($#)); do
   case "$1" in
     --gitea) DO_GITEA=true ;;
@@ -52,6 +62,7 @@ while (($#)); do
     --yes) YES=true ;;
     --signer) (($# >= 2)) || usage; SIGNER="$2"; shift ;;
     --age-identity) (($# >= 2)) || usage; IDENTITY="$2"; shift ;;
+    --config) (($# >= 2)) || usage; CONFIG="$2"; shift ;;
     -*) usage ;;
     *) [[ -z "$DIR" ]] || usage; DIR="$1" ;;
   esac
@@ -76,9 +87,33 @@ else
 fi
 trap 'rm -rf "$WORK"' EXIT
 
+# --- copy into a root-only directory if anybody else could change the backup -------------
+# (names of the files a restore of the chosen parts reads)
+files=(MANIFEST MANIFEST.sig FAILED)
+for p in "${parts[@]}"; do files+=("${p#*:}" "${p#*:}.age"); done
+trusted=true
+adk_dir_chain_trusted "$DIR" || trusted=false
+for f in "${files[@]}"; do
+  [[ -e "$DIR/$f" || -L "$DIR/$f" ]] || continue
+  if [[ -L "$DIR/$f" || ! -f "$DIR/$f" ]]; then trusted=false; continue; fi
+  read -r f_uid f_mode < <(stat -c '%u %a' "$DIR/$f")
+  [[ "$f_uid" == "$(id -u)" ]] && (((8#$f_mode & 8#022) == 0)) || trusted=false
+done
+SRC_DIR="$DIR"
+if [[ "$trusted" != true ]]; then
+  SRC_DIR="$WORK/backup"
+  mkdir -m 0700 "$SRC_DIR"
+  for f in "${files[@]}"; do
+    [[ -e "$DIR/$f" || -L "$DIR/$f" ]] || continue
+    # -P: a symlink stays a symlink (refused below), never followed
+    cp -P -- "$DIR/$f" "$SRC_DIR/$f" || adk_die "cannot copy $DIR/$f"
+  done
+  echo "backup $DIR: others could change it; verifying and using a root-only copy"
+fi
+
 # --- signature of MANIFEST ----------------------------------------------------------------------
-[[ -f "$DIR/MANIFEST" && ! -L "$DIR/MANIFEST" ]] || adk_die "$DIR has no MANIFEST (not written by backup.sh?)"
-[[ -f "$DIR/MANIFEST.sig" && ! -L "$DIR/MANIFEST.sig" ]] || adk_die "$DIR has no MANIFEST.sig: the backup is not signed, not restoring it"
+[[ -f "$SRC_DIR/MANIFEST" && ! -L "$SRC_DIR/MANIFEST" ]] || adk_die "$DIR has no MANIFEST (not written by backup.sh?)"
+[[ -f "$SRC_DIR/MANIFEST.sig" && ! -L "$SRC_DIR/MANIFEST.sig" ]] || adk_die "$DIR has no MANIFEST.sig: the backup is not signed, not restoring it"
 [[ -f "$SIGNER" ]] || adk_die "signer key $SIGNER not found (pass the backup signing public key with --signer)"
 if grep -qE '^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+( .*)?$' "$SIGNER"; then
   # a plain public key: make it an allowed-signers line
@@ -87,28 +122,53 @@ else
   cp "$SIGNER" "$WORK/allowed_signers"
 fi
 ssh-keygen -Y verify -f "$WORK/allowed_signers" -I "$SIGN_NAMESPACE" -n "$SIGN_NAMESPACE" \
-    -s "$DIR/MANIFEST.sig" < "$DIR/MANIFEST" > /dev/null 2>&1 \
+    -s "$SRC_DIR/MANIFEST.sig" < "$SRC_DIR/MANIFEST" > /dev/null 2>&1 \
   || adk_die "MANIFEST.sig does not verify with $SIGNER: the backup was changed or signed by another key"
 echo "backup $DIR: MANIFEST signature ok"
 
-# --- the chosen parts: decrypt if needed, checksums ------------------------------------------------
+# --- which backup: signed header vs. directory name and this server ------------------------
+read -r h_word h_ts h_server h_rest < "$SRC_DIR/MANIFEST" || true
+[[ "$h_word" == backup && "$h_ts" =~ ^[0-9]{8}T[0-9]{6}Z$ && -n "$h_server" && -z "${h_rest:-}" ]] \
+  || adk_die "MANIFEST has no header line \"backup <timestamp> <server>\" (backup of an older kit?); not restoring it"
+[[ "$h_ts" == "$(basename "$DIR")" ]] \
+  || adk_die "the backup was made at $h_ts but its directory is named $(basename "$DIR"): renamed (e.g. an older backup passed off as a newer one); not restoring it"
+if [[ -f "$CONFIG" ]] && load_config "$CONFIG" && [[ -n "${CFG[CUSTOMER_NAME]:-}" ]]; then
+  [[ "$h_server" == "adk-${CFG[CUSTOMER_NAME]}-agent" ]] \
+    || adk_die "the backup belongs to server $h_server, this is adk-${CFG[CUSTOMER_NAME]}-agent ($CONFIG); not restoring it"
+else
+  echo "WARNING: no $CONFIG to compare the server name with" >&2
+fi
+h_epoch="$(date -u -d "${h_ts:0:4}-${h_ts:4:2}-${h_ts:6:2} ${h_ts:9:2}:${h_ts:11:2}:${h_ts:13:2}" +%s)"
+age_s=$(($(date -u +%s) - h_epoch))
+if ((age_s < 0)); then
+  echo "WARNING: the backup's time $h_ts lies in the future (clock?)" >&2
+fi
+echo "backup of $h_server from $h_ts: $((age_s / 86400)) day(s) $((age_s % 86400 / 3600)) hour(s) old"
+
+# --- the chosen parts: checksums (ciphertext before decrypting, then the archive) ------------
+# sha256 FILE: the sha256 that the signed MANIFEST lists for FILE (empty if none)
+manifest_sum() { awk -v f="$1" 'NR > 1 && $2 == f && length($1) == 64 {print $1; exit}' "$SRC_DIR/MANIFEST"; }
 declare -A SRC=()
 for p in "${parts[@]}"; do
   name="${p%%:*}" file="${p#*:}"
-  if grep -qx "FAILED $name" "$DIR/MANIFEST" || { [[ -f "$DIR/FAILED" ]] && grep -q "^$name" "$DIR/FAILED"; }; then
+  if grep -qx "FAILED $name" "$SRC_DIR/MANIFEST" || { [[ -f "$SRC_DIR/FAILED" ]] && grep -q "^$name" "$SRC_DIR/FAILED"; }; then
     adk_die "part $name failed in this backup (see MANIFEST / FAILED); choose another backup"
   fi
-  grep -qE "^[0-9a-f]{64}  $file\$" "$DIR/MANIFEST" || adk_die "$file is not listed in MANIFEST"
-  if [[ -f "$DIR/$file" && ! -L "$DIR/$file" ]]; then
-    SRC[$name]="$DIR/$file"
-  elif [[ -f "$DIR/$file.age" && ! -L "$DIR/$file.age" ]]; then
+  want="$(manifest_sum "$file")"
+  [[ -n "$want" ]] || adk_die "$file is not listed in MANIFEST"
+  if [[ -f "$SRC_DIR/$file" && ! -L "$SRC_DIR/$file" ]]; then
+    SRC[$name]="$SRC_DIR/$file"
+  elif [[ -f "$SRC_DIR/$file.age" && ! -L "$SRC_DIR/$file.age" ]]; then
     [[ -n "$IDENTITY" ]] || adk_die "$file is encrypted ($file.age): pass the age private key with --age-identity"
-    age -d -i "$IDENTITY" -o "$WORK/$file" "$DIR/$file.age" || adk_die "cannot decrypt $file.age with $IDENTITY"
+    want_age="$(manifest_sum "$file.age")"
+    [[ -n "$want_age" ]] || adk_die "$file.age is not listed in MANIFEST; not decrypting it"
+    [[ "$(sha256sum < "$SRC_DIR/$file.age" | cut -d' ' -f1)" == "$want_age" ]] \
+      || adk_die "$file.age does not match its sha256 in MANIFEST; not decrypting it"
+    age -d -i "$IDENTITY" -o "$WORK/$file" "$SRC_DIR/$file.age" || adk_die "cannot decrypt $file.age with $IDENTITY"
     SRC[$name]="$WORK/$file"
   else
     adk_die "$DIR/$file is missing"
   fi
-  want="$(awk -v f="$file" '$2 == f && length($1) == 64 {print $1; exit}' "$DIR/MANIFEST")"
   [[ "$(sha256sum < "${SRC[$name]}" | cut -d' ' -f1)" == "$want" ]] || adk_die "$file does not match its sha256 in MANIFEST"
 done
 echo "backup $DIR: checksums ok (${parts[*]%%:*})"

@@ -88,3 +88,26 @@ setup() {
   [ "$(adk_backup_target_parts sftp://u1@box.example.com:23/backups/adk)" = "u1@box.example.com 23 /backups/adk" ]
   [ "$(adk_backup_target_parts sftp://u1@box.example.com)" = "u1@box.example.com 22 ." ]
 }
+
+@test "backup keys: the .pub is always derived from the private key (missing, replaced, symlinked)" {
+  # shellcheck disable=SC1091  # the real adk_put_file (with its symlink check)
+  source "$ROOT/agent/lib/host.sh"
+  k="$BATS_TEST_TMPDIR/adk-backup-sign"
+  ssh-keygen -q -t ed25519 -N '' -C sign -f "$k"
+  ssh-keygen -q -t ed25519 -N '' -C other -f "$BATS_TEST_TMPDIR/other"
+  want="$(ssh-keygen -y -f "$k")"
+  cp "$BATS_TEST_TMPDIR/other.pub" "$k.pub"
+  run adk_pub_from_private "$k"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$k.pub")" = "$want" ]
+  rm "$k.pub"
+  adk_pub_from_private "$k" > /dev/null
+  [ "$(cat "$k.pub")" = "$want" ]
+  run adk_pub_from_private "$k"
+  [[ "$output" == "ok: "* ]]
+  rm "$k.pub"
+  ln -s "$BATS_TEST_TMPDIR/other.pub" "$k.pub"
+  run adk_pub_from_private "$k"
+  [ "$status" -ne 0 ]
+  [ "$(cut -d' ' -f3 "$BATS_TEST_TMPDIR/other.pub")" = "other" ]
+}

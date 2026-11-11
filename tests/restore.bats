@@ -24,9 +24,15 @@ setup() {
   export PATH="$T/bin:$PATH"
 }
 
-# manifest: (re)write and sign MANIFEST like backup.sh
+# manifest [TS] [SERVER]: (re)write and sign MANIFEST like backup.sh (header, archives and
+# their .age copies)
 manifest() {
-  (cd "$B" && sha256sum -- *.tar* > MANIFEST)
+  (
+    cd "$B" || exit 1
+    printf 'backup %s %s\n' "${1:-20260101T033000Z}" "${2:-adk-acme-agent}"
+    sha256sum -- *.tar*
+  ) > "$T/MANIFEST.new"
+  mv "$T/MANIFEST.new" "$B/MANIFEST"
   sign
 }
 sign() {
@@ -34,7 +40,7 @@ sign() {
   ssh-keygen -q -Y sign -f "$T/sign" -n adk-backup "$B/MANIFEST" > /dev/null 2>&1
 }
 
-r() { "$RESTORE" --signer "$T/sign.pub" "$@"; }
+r() { "$RESTORE" --signer "$T/sign.pub" --config "$ROOT/tests/fixtures/valid.env" "$@"; }
 
 no_docker() { [ ! -e "$T/docker.log" ]; }
 
@@ -96,7 +102,7 @@ refute() {
   [[ "$output" == *"does not verify"* ]]
   # attacker replaces an archive and fixes up the (unsigned) checksum
   printf 'evil\n' | gzip > "$B/hermes-home.tar.gz"
-  (cd "$B" && sha256sum -- *.tar* > MANIFEST)
+  (cd "$B" && { printf 'backup 20260101T033000Z adk-acme-agent\n'; sha256sum -- *.tar*; } > MANIFEST)
   run r --hermes-home "$B"
   [ "$status" -eq 1 ]
   [[ "$output" == *"does not verify"* ]]
@@ -193,7 +199,9 @@ refute() {
 @test "encrypted off-site copy: needs --age-identity, then verifies like a local backup" {
   command -v age > /dev/null || skip "age not installed"
   age-keygen -o "$T/age.key" 2> /dev/null
-  for f in "$B"/*.tar*; do age -r "$(age-keygen -y "$T/age.key")" -o "$f.age" "$f" && rm "$f"; done
+  for f in "$B"/*.tar*; do age -r "$(age-keygen -y "$T/age.key")" -o "$f.age" "$f"; done
+  manifest
+  rm "$B"/*.tar "$B"/*.tar.gz
   run r --gitea --secrets --hermes-home "$B"
   [ "$status" -eq 1 ]
   [[ "$output" == *"--age-identity"* ]]
@@ -210,4 +218,72 @@ refute() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"run as root"* ]]
   no_docker
+}
+
+@test "the signed header must match the directory name: a renamed (older) backup is refused" {
+  run r "$B"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"backup of adk-acme-agent from 20260101T033000Z:"*"day(s)"*"old"* ]]
+  mv "$B" "$T/20991231T033000Z"
+  run r "$T/20991231T033000Z"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"renamed"* ]]
+  no_docker
+}
+
+@test "a backup of another server or without a header is refused" {
+  manifest 20260101T033000Z adk-other-agent
+  run r "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"belongs to server adk-other-agent"* ]]
+  (cd "$B" && sha256sum -- *.tar* > MANIFEST) && sign
+  run r "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no header line"* ]]
+  no_docker
+}
+
+@test "encrypted copy: the ciphertext is checked against the signed MANIFEST before decrypting" {
+  command -v age > /dev/null || skip "age not installed"
+  age-keygen -o "$T/age.key" 2> /dev/null
+  age -r "$(age-keygen -y "$T/age.key")" -o "$B/hermes-home.tar.gz.age" "$B/hermes-home.tar.gz"
+  manifest
+  rm "$B/hermes-home.tar.gz"
+  # a different ciphertext of the same archive (age output is random): refused, not decrypted
+  printf 'other\n' | gzip | age -r "$(age-keygen -y "$T/age.key")" -o "$B/hermes-home.tar.gz.age"
+  run r --hermes-home --age-identity "$T/age.key" "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"hermes-home.tar.gz.age does not match its sha256 in MANIFEST; not decrypting it"* ]]
+  # a ciphertext the MANIFEST does not list at all
+  grep -v '\.age$' "$B/MANIFEST" > "$T/m" && mv "$T/m" "$B/MANIFEST" && sign
+  run r --hermes-home --age-identity "$T/age.key" "$B"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not listed in MANIFEST; not decrypting it"* ]]
+}
+
+@test "a backup directory others could change is verified and used as a root-only copy" {
+  mkdir -m 0777 "$T/shared"
+  mv "$B" "$T/shared/"
+  S="$T/shared/20260101T033000Z"
+  run r --gitea --secrets --hermes-home "$S"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"others could change it; verifying and using a root-only copy"* ]]
+  [[ "$output" == *"checksums ok (gitea-dump adk-secrets hermes-home)"* ]]
+  # a symlinked MANIFEST stays a symlink in the copy and is refused
+  mv "$S/MANIFEST" "$T/real-manifest"
+  ln -s "$T/real-manifest" "$S/MANIFEST"
+  run r "$S"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"has no MANIFEST"* ]]
+  no_docker
+}
+
+@test "a group-writable file in an otherwise private backup also leads to the copy" {
+  chmod g+w "$B/hermes-home.tar.gz"
+  run r --hermes-home "$B"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"root-only copy"* ]]
+  chmod g-w "$B/hermes-home.tar.gz"
+  run r --hermes-home "$B"
+  [[ "$output" != *"root-only copy"* ]]
 }

@@ -2,17 +2,24 @@
 # Nightly backup of the agent VPS (adk-backup.timer, 03:30). Runs as root.
 #
 # Usage: sudo /opt/adk/agent/backup.sh [--config FILE]     (default: /opt/adk/kit.env)
+#        sudo /opt/adk/agent/backup.sh --ensure-gitea       (ExecStopPost of adk-backup.service)
 #
 # Writes /var/backups/adk/<UTC timestamp>/ (root, 0700; local copies are NOT encrypted):
 #   gitea-dump.tar.gz   `gitea dump` (database as SQL, repositories, data, app.ini) of a
 #                       STOPPED Gitea: a one-off container of the same image dumps as user git
-#                       while the service is down (no pushes or jobs during the dump);
-#                       Gitea is started again afterwards in any case
+#                       while the service is down (no pushes or jobs during the dump; at most
+#                       2 hours); Gitea is started again afterwards in any case: by this script,
+#                       and if it is killed (or the server shuts down meanwhile) by
+#                       --ensure-gitea, which adk-backup.service runs as ExecStopPost (a marker
+#                       file records that the backup stopped Gitea)
 #   adk-secrets.tar     /opt/adk/secrets and /opt/adk/kit.env
 #   hermes-home.tar.gz  home of hermes, packed AS hermes (tar never follows symlinks; root never
 #                       reads in that home); without caches (.cache, node_modules), the rootless
 #                       Docker data and the Hermes software that setup.sh installs again
-#   MANIFEST            sha256 of the files above, plus "FAILED <part>" lines
+#   MANIFEST            first line "backup <UTC timestamp> <server name adk-CUSTOMER_NAME-agent>"
+#                       (restore.sh compares it with the directory name: an older backup cannot
+#                       pass as a newer one), sha256 of the files above and, with BACKUP_TARGET,
+#                       of their age-encrypted copies, plus "FAILED <part>" lines
 #   MANIFEST.sig        ssh-keygen -Y signature of MANIFEST (key /root/.ssh/adk-backup-sign,
 #                       namespace adk-backup); restore.sh verifies it
 # Before starting, the free space on /var/backups is checked against the size of the data.
@@ -26,7 +33,7 @@
 #
 # Tests (non-root with ADK_AS_USER_HOOK): ADK_BACKUP_DIR, ADK_TEST_HERMES_HOME,
 # ADK_TEST_KIT_DIR, ADK_TEST_GITEA_DATA, ADK_BACKUP_SIGN_KEY, ADK_BACKUP_SSH_DIR replace the
-# real paths; ADK_TEST_FREE_KB fakes the free space.
+# real paths; ADK_TEST_FREE_KB fakes the free space, ADK_TEST_DUMP_TIMEOUT the dump timeout.
 set -euo pipefail
 export LC_ALL=C
 umask 077
@@ -47,13 +54,18 @@ HOME_EXCLUDES=(--exclude=.cache --exclude=node_modules --exclude=./.local/share/
   --exclude=./.local/share/uv --exclude=./.hermes/hermes-agent --exclude=./.hermes/tools
   --exclude=./.hermes/cache --exclude=./.hermes/installs)
 
-usage() { echo "usage: $0 [--config FILE]" >&2; exit 2; }
+DUMP_TIMEOUT=2h
+DUMP_CONTAINER=adk-backup-dump
+
+usage() { echo "usage: $0 [--config FILE] | --ensure-gitea" >&2; exit 2; }
 
 KIT_DIR=/opt/adk
 CONFIG=""
+ENSURE_GITEA=false
 while (($#)); do
   case "$1" in
     --config) (($# >= 2)) || usage; CONFIG="$2"; shift 2 ;;
+    --ensure-gitea) ENSURE_GITEA=true; shift ;;
     *) usage ;;
   esac
 done
@@ -70,6 +82,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   SIGN_KEY="$ADK_BACKUP_SIGN_KEY"
   SSH_DIR="$ADK_BACKUP_SSH_DIR"
   FREE_KB="${ADK_TEST_FREE_KB:-}"
+  DUMP_TIMEOUT="${ADK_TEST_DUMP_TIMEOUT:-$DUMP_TIMEOUT}"
 else
   BACKUP_ROOT=/var/backups/adk
   AGENT_HOME="$(adk_user_home "$AGENT_USER")"
@@ -79,6 +92,30 @@ else
 fi
 BACKUP_KEY="$SSH_DIR/adk-backup"
 KNOWN_HOSTS="$SSH_DIR/adk-backup.known_hosts"
+# exists while Gitea is stopped by a backup (root-only directory)
+GITEA_MARKER="$BACKUP_ROOT/.gitea-stopped-by-backup"
+
+compose() { docker compose -f "$COMPOSE_FILE" --project-directory "$SERVICES_DIR" "$@"; }
+log() { echo "backup: $*"; }
+
+# start_gitea_if_stopped: start Gitea if a backup stopped it (marker), then drop the marker
+start_gitea_if_stopped() {
+  [[ -e "$GITEA_MARKER" ]] || return 0
+  if compose start gitea > /dev/null 2>&1 || compose up -d gitea > /dev/null 2>&1; then
+    rm -f "$GITEA_MARKER"
+    log "gitea started again"
+  else
+    echo "ERROR: gitea could not be started again after the dump; start it: docker compose -f $COMPOSE_FILE up -d gitea" >&2
+    return 1
+  fi
+}
+
+if [[ "$ENSURE_GITEA" == true ]]; then
+  [[ ! -L "$BACKUP_ROOT" ]] || adk_die "$BACKUP_ROOT is a symlink"
+  start_gitea_if_stopped
+  exit
+fi
+
 CONFIG="${CONFIG:-$KIT_DIR/kit.env}"
 [[ -f "$CONFIG" ]] || { echo "ERROR: config file not found: $CONFIG" >&2; exit 2; }
 load_config "$CONFIG"
@@ -86,9 +123,8 @@ load_config "$CONFIG"
 TARGET="${CFG[BACKUP_TARGET]:-}"
 RECIPIENT="${CFG[BACKUP_AGE_RECIPIENT]:-}"
 [[ -z "$TARGET" || -n "$RECIPIENT" ]] || adk_die "BACKUP_TARGET without BACKUP_AGE_RECIPIENT (run scripts/check-config.sh)"
-
-compose() { docker compose -f "$COMPOSE_FILE" --project-directory "$SERVICES_DIR" "$@"; }
-log() { echo "backup: $*"; }
+# the server's name (agent/provision.sh), signed into MANIFEST
+SERVER_NAME="adk-${CFG[CUSTOMER_NAME]}-agent"
 
 [[ ! -L "$BACKUP_ROOT" ]] || adk_die "$BACKUP_ROOT is a symlink"
 mkdir -p "$BACKUP_ROOT"
@@ -120,21 +156,20 @@ FAILED=()
 fail() { echo "ERROR: $*" >&2; FAILED+=("$1"); }
 
 # --- Gitea (stopped while the dump runs) ----------------------------------------------------
-log "gitea dump (gitea stopped meanwhile)"
-GITEA_STOPPED=false
-start_gitea() {
-  [[ "$GITEA_STOPPED" == true ]] || return 0
-  GITEA_STOPPED=false
-  compose start gitea > /dev/null 2>&1 || compose up -d gitea > /dev/null 2>&1 \
-    || { echo "ERROR: gitea could not be started again after the dump; start it: docker compose -f $COMPOSE_FILE up -d gitea" >&2; return 1; }
-}
-trap 'start_gitea || true' EXIT
+log "gitea dump (gitea stopped meanwhile, at most $DUMP_TIMEOUT)"
+trap 'start_gitea_if_stopped || true' EXIT
+trap 'exit 1' INT TERM HUP
+: > "$GITEA_MARKER"
 if compose stop gitea > /dev/null 2>&1; then
-  GITEA_STOPPED=true
+  docker rm -f "$DUMP_CONTAINER" > /dev/null 2>&1 || true
+  rc=0
+  timeout --kill-after=60s "$DUMP_TIMEOUT" docker compose -f "$COMPOSE_FILE" --project-directory "$SERVICES_DIR" run --rm --no-deps --name "$DUMP_CONTAINER" -T -w /tmp gitea \
+    su-exec git gitea dump --type tar.gz --file - --quiet < /dev/null > "$DIR/gitea-dump.tar.gz" || rc=$?
+  if ((rc == 124 || rc == 137)); then
+    docker rm -f "$DUMP_CONTAINER" > /dev/null 2>&1 || true
+    fail "gitea-dump: gitea dump did not finish within $DUMP_TIMEOUT"
   # (listing first, then grep: "grep -q" in a pipe would make tar die of SIGPIPE under pipefail)
-  if compose run --rm --no-deps -T -w /tmp gitea su-exec git gitea dump --type tar.gz --file - --quiet \
-      < /dev/null > "$DIR/gitea-dump.tar.gz" \
-    && listing="$(tar -tzf "$DIR/gitea-dump.tar.gz")" && grep -qx 'gitea-db.sql' <<< "$listing"; then
+  elif ((rc == 0)) && listing="$(tar -tzf "$DIR/gitea-dump.tar.gz")" && grep -qx 'gitea-db.sql' <<< "$listing"; then
     log "gitea-dump.tar.gz $(du -h "$DIR/gitea-dump.tar.gz" | cut -f1)"
   else
     fail "gitea-dump: gitea dump failed or the archive has no gitea-db.sql"
@@ -142,7 +177,7 @@ if compose stop gitea > /dev/null 2>&1; then
 else
   fail "gitea-dump: cannot stop gitea for a consistent dump"
 fi
-start_gitea || FAILED+=("gitea-start")
+start_gitea_if_stopped || FAILED+=("gitea-start")
 
 # --- secrets and kit.env -------------------------------------------------------------------
 log "secrets"
@@ -165,10 +200,33 @@ case "$rc" in
   *) fail "hermes-home: tar as $AGENT_USER exited with $rc (unreadable files? see above)" ;;
 esac
 
+# --- off-site: encrypted first, so the signed MANIFEST covers the ciphertexts too -----------
+STAGE=""
+if [[ -n "$TARGET" ]]; then
+  if [[ ! -f "$BACKUP_KEY" ]]; then
+    fail "offsite: $BACKUP_KEY missing (run setup.sh)"
+  elif [[ ! -s "$KNOWN_HOSTS" ]]; then
+    fail "offsite: host key of the target not pinned (run setup.sh, then setup.sh --accept-backup-hostkey <fingerprint>)"
+  elif ! command -v age > /dev/null; then
+    fail "offsite: age is not installed (run setup.sh)"
+  else
+    stage="$BACKUP_ROOT/.offsite-$TS"
+    rm -rf -- "$stage"
+    mkdir -m 0700 "$stage"
+    ok=true
+    for f in "$DIR"/*.tar*; do
+      age -r "$RECIPIENT" -o "$stage/$(basename "$f").age" "$f" || { ok=false; break; }
+    done
+    if [[ "$ok" == true ]]; then STAGE="$stage"; else rm -rf -- "$stage"; fail "offsite: age encryption failed"; fi
+  fi
+fi
+
 # --- manifest and signature -----------------------------------------------------------------
 (
+  printf 'backup %s %s\n' "$TS" "$SERVER_NAME"
   cd "$DIR"
   sha256sum -- *.tar*
+  if [[ -n "$STAGE" ]]; then (cd "$STAGE" && sha256sum -- *.age); fi
   for f in "${FAILED[@]}"; do printf 'FAILED %s\n' "${f%%:*}"; done
 ) > "$DIR/MANIFEST"
 if [[ -f "$SIGN_KEY" && ! -L "$SIGN_KEY" ]] \
@@ -196,7 +254,7 @@ while IFS= read -r old; do
 done < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]{8}T[0-9]{6}Z' -printf '%f\n' | sort)
 
 # --- off-site copy: encrypted, signed, pinned host key --------------------------------------
-if [[ -n "$TARGET" ]]; then
+if [[ -n "$STAGE" ]]; then
   rest="${TARGET#sftp://}"
   userhost="${rest%%/*}"
   path="/${rest#*/}"
@@ -204,33 +262,19 @@ if [[ -n "$TARGET" ]]; then
   port=22
   if [[ "$userhost" == *:* ]]; then port="${userhost##*:}"; userhost="${userhost%:*}"; fi
   log "encrypted copy to $userhost:$path/$TS (port $port)"
-  stage="$BACKUP_ROOT/.offsite-$TS"
-  if [[ ! -f "$BACKUP_KEY" ]]; then
-    fail "offsite: $BACKUP_KEY missing (run setup.sh)"
-  elif [[ ! -s "$KNOWN_HOSTS" ]]; then
-    fail "offsite: host key of the target not pinned (run setup.sh, then setup.sh --accept-backup-hostkey <fingerprint>)"
-  elif ! command -v age > /dev/null; then
-    fail "offsite: age is not installed (run setup.sh)"
+  ok=true
+  cp -p "$DIR/MANIFEST" "$STAGE/" || ok=false
+  [[ ! -f "$DIR/MANIFEST.sig" ]] || cp -p "$DIR/MANIFEST.sig" "$STAGE/" || ok=false
+  [[ ! -f "$DIR/FAILED" ]] || cp -p "$DIR/FAILED" "$STAGE/" || ok=false
+  if [[ "$ok" != true ]]; then
+    fail "offsite: cannot stage MANIFEST and signature"
+  elif ! rsync -a --partial -e "ssh -i $BACKUP_KEY -p $port -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN_HOSTS" \
+      "$STAGE/" "$userhost:$path/$TS/"; then
+    fail "offsite: rsync to $userhost:$path failed"
   else
-    rm -rf -- "$stage"
-    mkdir -m 0700 "$stage"
-    ok=true
-    for f in "$DIR"/*.tar*; do
-      age -r "$RECIPIENT" -o "$stage/$(basename "$f").age" "$f" || { ok=false; break; }
-    done
-    cp -p "$DIR/MANIFEST" "$stage/" || ok=false
-    [[ ! -f "$DIR/MANIFEST.sig" ]] || cp -p "$DIR/MANIFEST.sig" "$stage/" || ok=false
-    [[ ! -f "$DIR/FAILED" ]] || cp -p "$DIR/FAILED" "$stage/" || ok=false
-    if [[ "$ok" != true ]]; then
-      fail "offsite: age encryption failed"
-    elif ! rsync -a --partial -e "ssh -i $BACKUP_KEY -p $port -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN_HOSTS" \
-        "$stage/" "$userhost:$path/$TS/"; then
-      fail "offsite: rsync to $userhost:$path failed"
-    else
-      log "off-site: $(find "$stage" -maxdepth 1 -name '*.age' | wc -l) encrypted archive(s), MANIFEST and signature copied"
-    fi
-    rm -rf -- "$stage"
+    log "off-site: $(find "$STAGE" -maxdepth 1 -name '*.age' | wc -l) encrypted archive(s), MANIFEST and signature copied"
   fi
+  rm -rf -- "$STAGE"
 fi
 
 if ((${#FAILED[@]})); then

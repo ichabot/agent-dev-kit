@@ -299,6 +299,17 @@ adk_backup_target_parts() {
   printf '%s %s %s\n' "$userhost" "$port" "$path"
 }
 
+# adk_pub_from_private KEY: KEY.pub derived from the private KEY again (ssh-keygen -y), so a
+# missing or replaced .pub never disagrees with the key that actually signs (the allowed
+# signers file is built from it)
+adk_pub_from_private() {
+  local key="$1" pub
+  [[ -f "$key" && ! -L "$key" ]] || adk_die "$key is missing or a symlink"
+  pub="$(ssh-keygen -y -f "$key" 2> /dev/null)" || adk_die "cannot derive the public key of $key"
+  [[ -n "$pub" ]] || adk_die "cannot derive the public key of $key"
+  adk_put_file "$key.pub" 0644 "$(id -un):$(id -gn)" <<< "$pub" || true
+}
+
 # adk_backup_setup TARGET CUSTOMER [ACCEPT_FINGERPRINT]: local backup directory, daily timer
 # (03:30, before the 04:30 unattended reboot), the MANIFEST signing key (always: restore.sh
 # verifies every backup), and for an off-site TARGET a dedicated SSH key (public part shown)
@@ -325,7 +336,8 @@ adk_backup_setup() {
   fi
   install -d -m 0700 -o root -g root /root/.ssh
   # signing key for MANIFEST (root only); its public key goes offline with the age key
-  if [[ -f "$sign" && -f "$sign.pub" && ! -L "$sign" ]]; then
+  if [[ -f "$sign" && ! -L "$sign" ]]; then
+    adk_pub_from_private "$sign"
     adk_ok "backup signing key $sign"
   else
     [[ ! -L "$sign" ]] || adk_die "$sign is a symlink"
@@ -337,7 +349,8 @@ adk_backup_setup() {
   fi
   adk_put_file "$signers" 0644 root:root <<< "adk-backup $(cut -d' ' -f1,2 "$sign.pub")" || true
   [[ -n "$target" ]] || { [[ -z "$accept" ]] || adk_die "--accept-backup-hostkey needs BACKUP_TARGET in kit.env"; return 0; }
-  if [[ -f /root/.ssh/adk-backup && -f /root/.ssh/adk-backup.pub ]]; then
+  if [[ -f /root/.ssh/adk-backup && ! -L /root/.ssh/adk-backup ]]; then
+    adk_pub_from_private /root/.ssh/adk-backup
     adk_ok "backup key /root/.ssh/adk-backup (public: /root/.ssh/adk-backup.pub)"
   else
     [[ ! -L /root/.ssh/adk-backup ]] || adk_die "/root/.ssh/adk-backup is a symlink"

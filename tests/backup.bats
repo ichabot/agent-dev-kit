@@ -225,6 +225,10 @@ offsite_config() {
   grep -q "u1@box.example.com:/backups/adk/$(newest)/\$" "$RSYNC_LOG"
   # no staging directory left behind
   [ -z "$(find "$ADK_BACKUP_DIR" -maxdepth 1 -name '.offsite-*')" ]
+  # the signed MANIFEST also covers the ciphertexts (checked before anything is decrypted)
+  (cd "$RSYNC_DEST" && sha256sum -c --ignore-missing --quiet MANIFEST)
+  [ "$(grep -cE '^[0-9a-f]{64}  [a-z-]+\.tar(\.gz)?\.age$' "$RSYNC_DEST/MANIFEST")" -eq 3 ]
+  cmp "$RSYNC_DEST/MANIFEST" "$d/MANIFEST"
 }
 
 @test "BACKUP_TARGET without a pinned host key: nothing is copied, the run fails" {
@@ -258,4 +262,54 @@ offsite_config() {
   run env -u ADK_BACKUP_SIGN_KEY "$BACKUP"
   [ "$status" -eq 2 ]
   [[ "$output" == *"run as root"* ]]
+}
+
+@test "MANIFEST starts with a signed header: backup <timestamp> <server name>" {
+  run "$BACKUP"
+  [ "$status" -eq 0 ]
+  ts="$(newest)"
+  [ "$(head -n 1 "$ADK_BACKUP_DIR/$ts/MANIFEST")" = "backup $ts adk-acme-agent" ]
+}
+
+@test "a dump that hangs is ended after the timeout; gitea runs again, the run fails" {
+  FAKE_DUMP_SLEEP=5 ADK_TEST_DUMP_TIMEOUT=1s run "$BACKUP"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not finish within 1s"* ]]
+  grep -qx 'rm -f adk-backup-dump' "$FAKE_LOG"
+  [ "$(grep -c '^compose start gitea' "$FAKE_LOG")" -eq 1 ]
+  [ ! -e "$ADK_BACKUP_DIR/.gitea-stopped-by-backup" ]
+}
+
+@test "--ensure-gitea (ExecStopPost) starts gitea only if a backup stopped it" {
+  run "$BACKUP" --ensure-gitea
+  [ "$status" -eq 0 ]
+  refute grep -q '^compose start' "$FAKE_LOG"
+  # a backup killed while gitea was stopped leaves the marker
+  mkdir -p "$ADK_BACKUP_DIR"
+  : > "$ADK_BACKUP_DIR/.gitea-stopped-by-backup"
+  run "$BACKUP" --ensure-gitea
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^compose start gitea' "$FAKE_LOG")" -eq 1 ]
+  [ ! -e "$ADK_BACKUP_DIR/.gitea-stopped-by-backup" ]
+}
+
+@test "a killed backup run starts gitea again (signal trap)" {
+  FAKE_DUMP_SLEEP=30; export FAKE_DUMP_SLEEP
+  # SIGTERM to every process of the run, as systemd does when it stops the unit (timeout(1)
+  # puts itself into its own process group)
+  set -m
+  "$BACKUP" > /dev/null 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 1 50); do grep -q '^run (one-off container)' "$FAKE_LOG" && break; sleep 0.1; done
+  kill -TERM -- "-$pid"
+  pkill -TERM -f '^timeout --kill-after=60s' || true
+  wait "$pid" || true
+  [ "$(grep -c '^compose start gitea' "$FAKE_LOG")" -eq 1 ]
+  [ ! -e "$ADK_BACKUP_DIR/.gitea-stopped-by-backup" ]
+}
+
+@test "adk-backup.service: --ensure-gitea after every run, bounded run time" {
+  grep -qx 'ExecStopPost=/opt/adk/agent/backup.sh --ensure-gitea' "$ROOT/agent/systemd/adk-backup.service"
+  grep -qE '^TimeoutStartSec=[0-9]+h$' "$ROOT/agent/systemd/adk-backup.service"
 }
