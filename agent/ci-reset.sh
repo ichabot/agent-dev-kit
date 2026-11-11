@@ -4,9 +4,11 @@
 #
 # Usage: /opt/adk/agent/ci-reset.sh wipe|prepare [--config FILE]   (default: /opt/adk/kit.env)
 #
-#   wipe     stop and kill everything of user ci, delete its home, the runner state and its
-#            files elsewhere, recreate home and state empty
-#   prepare  wipe, rootless Docker for ci, pinned job image, new ephemeral registration
+#   wipe     expire ci's account, drop linger and its cron/at spool entries, kill everything
+#            of user ci, delete its home, the runner state and its files elsewhere, recreate
+#            home and state empty
+#   prepare  wipe, account valid again + linger, rootless Docker for ci, pinned job image,
+#            new ephemeral registration
 # Exit codes: 0 = done, 1 = failure, 2 = usage.
 set -euo pipefail
 export LC_ALL=C
@@ -53,6 +55,7 @@ echo "wiped: user $ADK_CI_USER (processes, home, rootless Docker, user units, ru
 
 load_config "$CONFIG"
 ((${#CFG_ERRORS[@]} == 0)) || adk_die "invalid $CONFIG (run scripts/check-config.sh)"
+adk_ci_unlock "$ADK_CI_USER"
 adk_ensure_rootless_docker "$ADK_CI_USER" > /dev/null
 echo "prepared: rootless Docker for $ADK_CI_USER"
 adk_user_env "$ADK_CI_USER" env DOCKER_HOST="unix:///run/user/$(id -u "$ADK_CI_USER")/docker.sock" \

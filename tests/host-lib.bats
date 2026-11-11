@@ -331,3 +331,58 @@ snapshot() {
   grep -qx 'LLMNR=no' <<< "$output"
   grep -qx 'MulticastDNS=no' <<< "$output"
 }
+
+@test "adk_egress_unit: loaded early, reloaded with nftables (PartOf), user.slice created first" {
+  run adk_egress_unit /etc/adk/egress.nft
+  [ "$status" -eq 0 ]
+  grep -qx 'PartOf=nftables.service' <<< "$output"
+  grep -qE '^After=.*nftables.service' <<< "$output"
+  grep -qx 'ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/user.slice' <<< "$output"
+  grep -qx 'ExecStart=/usr/sbin/nft -f /etc/adk/egress.nft' <<< "$output"
+  grep -qx 'ExecStop=/usr/sbin/nft delete table inet adk_egress' <<< "$output"
+  grep -qx 'WantedBy=sysinit.target' <<< "$output"
+}
+
+@test "adk_nftables_dropin: starting or reloading nftables (flush ruleset) loads the egress table again" {
+  run adk_nftables_dropin /etc/adk/egress.nft
+  [ "$status" -eq 0 ]
+  grep -qx '\[Service\]' <<< "$output"
+  [ "$(grep '^ExecStartPost=' <<< "$output")" = "$(printf 'ExecStartPost=/bin/mkdir -p /sys/fs/cgroup/user.slice\nExecStartPost=/usr/sbin/nft -f /etc/adk/egress.nft')" ]
+  grep -qx 'ExecReload=/usr/sbin/nft -f /etc/adk/egress.nft' <<< "$output"
+}
+
+@test "adk_deny_cron_at: the user lands in cron.deny and at.deny, existing lines and modes stay" {
+  E="$BATS_TEST_TMPDIR/etc"
+  mkdir -p "$E"
+  printf 'alice\nbob' > "$E/at.deny"
+  chmod 0640 "$E/at.deny"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$E/at.deny")" = "$(printf 'alice\nbob\nci')" ]
+  [ "$(stat -c %a "$E/at.deny")" = "640" ]
+  [ "$(cat "$E/cron.deny")" = "ci" ]
+  [ "$(stat -c %a "$E/cron.deny")" = "644" ]
+  # second run: nothing to do
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *changed* ]]
+}
+
+@test "adk_deny_cron_at: an allow list naming the user stops setup, one without it is enough" {
+  E="$BATS_TEST_TMPDIR/etc"
+  mkdir -p "$E"
+  printf 'root\n' > "$E/cron.allow"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -eq 0 ]
+  [ ! -e "$E/cron.deny" ]
+  [ "$(cat "$E/at.deny")" = "ci" ]
+  printf 'ci\n' >> "$E/cron.allow"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cron.allow"* ]]
+  ln -s "$BATS_TEST_TMPDIR/file" "$E/at.deny.lnk"
+  rm -f "$E/cron.allow" "$E/at.deny"
+  ln -s "$BATS_TEST_TMPDIR/file" "$E/at.deny"
+  run adk_deny_cron_at ci "$E"
+  [ "$status" -ne 0 ]
+}

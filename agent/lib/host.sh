@@ -8,6 +8,8 @@
 # user plants cannot redirect root to a system file.
 
 ADK_CHANGES=${ADK_CHANGES:-0}
+# First uid/gid of regular users: owners below it are system accounts (root, daemon, ...).
+ADK_UID_MIN=1000
 _ADK_HOST_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 adk_ok() { echo "ok: $*"; }
@@ -249,4 +251,92 @@ table inet adk_egress {
   }
 }
 EOF
+}
+
+# adk_egress_unit RULES_FILE: adk-egress.service (stdout). Loads the table early at boot; PartOf
+# nftables.service: stopping or restarting nftables (whose /etc/nftables.conf starts with
+# "flush ruleset") stops/restarts it too, and with it the CI runner (BindsTo).
+adk_egress_unit() {
+  cat <<EOF
+[Unit]
+Description=agent-dev-kit egress limits (nftables table inet adk_egress)
+Documentation=file:///opt/adk/docs/agent-vps.md
+DefaultDependencies=no
+After=local-fs.target nftables.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The ruleset matches the cgroup user.slice, resolved at load time: create it if systemd has
+# not yet (early boot); systemd adopts the existing directory.
+ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/user.slice
+ExecStart=/usr/sbin/nft -f $1
+ExecReload=/usr/sbin/nft -f $1
+ExecStop=/usr/sbin/nft delete table inet adk_egress
+
+[Install]
+WantedBy=sysinit.target
+EOF
+}
+
+# adk_nftables_dropin RULES_FILE: drop-in for nftables.service (stdout). Its start and reload
+# run "flush ruleset" (Debian's /etc/nftables.conf), which also removes table adk_egress:
+# load it again right after (ExecReload lines of a drop-in are appended).
+adk_nftables_dropin() {
+  cat <<EOF
+# agent-dev-kit: /etc/nftables.conf flushes the whole ruleset; load the egress limits again
+[Service]
+ExecStartPost=/bin/mkdir -p /sys/fs/cgroup/user.slice
+ExecStartPost=/usr/sbin/nft -f $1
+ExecReload=/usr/sbin/nft -f $1
+EOF
+}
+
+# adk_deny_cron_at USER [ETC]: USER may not use crontab or at (ETC/cron.deny, ETC/at.deny; an
+# existing allow list wins and must not name USER). Existing lines, mode and owner are kept.
+adk_deny_cron_at() {
+  local user="$1" etc="${2:-/etc}" kind allow deny mode owner
+  for kind in cron at; do
+    allow="$etc/$kind.allow" deny="$etc/$kind.deny"
+    if [[ -e "$allow" || -L "$allow" ]]; then
+      [[ -f "$allow" && ! -L "$allow" ]] || adk_die "$allow is not a regular file"
+      if grep -qxF -- "$user" "$allow"; then adk_die "$allow allows $user; remove that line"; fi
+      adk_ok "$allow exists without $user ($kind denied)"
+      continue
+    fi
+    [[ ! -L "$deny" ]] || adk_die "$deny is a symlink; not following it"
+    if [[ -f "$deny" ]] && grep -qxF -- "$user" "$deny"; then
+      adk_ok "$deny: $user"
+      continue
+    fi
+    mode=0644 owner="$(id -un):$(id -gn)"
+    [[ ! -f "$deny" ]] || { mode="0$(stat -c %a "$deny")"; owner="$(stat -c %U:%G "$deny")"; }
+    adk_put_file "$deny" "$mode" "$owner" < <(
+      [[ ! -s "$deny" ]] || { cat "$deny"; [[ -z "$(tail -c 1 "$deny")" ]] || echo; }
+      printf '%s\n' "$user"
+    ) || true
+  done
+}
+
+# adk_dir_chain_trusted DIR: DIR and all its parents are real directories that no
+# unprivileged user can change: owned by a system account (or the caller), group-writable
+# only for a system group (or the caller's), other-writable only with the sticky bit
+adk_dir_chain_trusted() {
+  local d="$1" me mygid uid gid mode
+  me="$(id -u)" mygid="$(id -g)"
+  [[ "$d" == /* && "$d" != *//* && "/$d/" != */../* && "/$d/" != */./* ]] || return 1
+  while :; do
+    [[ -d "$d" && ! -L "$d" ]] || return 1
+    read -r uid gid mode < <(stat -c '%u %g %a' "$d")
+    mode=$((8#$mode))
+    ((uid < ADK_UID_MIN || uid == me)) || return 1
+    (((mode & 8#020) == 0 || gid < ADK_UID_MIN || gid == mygid)) || return 1
+    (((mode & 8#002) == 0 || (mode & 8#1000) != 0)) || return 1
+    [[ "$d" != / ]] || return 0
+    d="$(dirname "$d")"
+  done
 }

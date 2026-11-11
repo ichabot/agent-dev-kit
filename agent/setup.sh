@@ -49,6 +49,7 @@ DOCKER_KEY=/etc/apt/keyrings/docker.asc
 DOCKER_KEY_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 EGRESS_RULES=/etc/adk/egress.nft
 EGRESS_UNIT=/etc/systemd/system/adk-egress.service
+NFTABLES_DROPIN=/etc/systemd/system/nftables.service.d/50-adk-egress.conf
 SWAP_FILE=/swapfile
 SWAP_SIZE=2G
 
@@ -222,8 +223,11 @@ adk_setup_rootless_user "$AGENT_USER"
 
 echo "== user $CI_USER (CI runner)"
 # Only the account here: its rootless Docker is set up fresh before every CI job by the
-# runner unit (agent/ci-reset.sh prepare) and wiped after it.
-adk_ensure_unprivileged_user "$CI_USER"
+# runner unit (agent/ci-reset.sh prepare) and wiped after it; ci-reset.sh also switches its
+# linger and account expiry (off/expired between jobs). No cron or at jobs, ever: they would
+# outlive the wipe.
+adk_ensure_unprivileged_user "$CI_USER" no-linger
+adk_deny_cron_at "$CI_USER"
 
 echo "== egress limits (nftables)"
 # sshd's PermitOpen only limits tunnels; a shell as hermes has open outbound. This table is
@@ -238,30 +242,11 @@ done
 egress_rules="$(adk_egress_rules "$egress_uids" "$egress_gids")"
 egress_reload=false
 adk_put_file "$EGRESS_RULES" 0644 root:root <<< "$egress_rules" && egress_reload=true
-if adk_put_file "$EGRESS_UNIT" 0644 root:root <<EOF
-[Unit]
-Description=agent-dev-kit egress limits (nftables table inet adk_egress)
-Documentation=file:///opt/adk/docs/agent-vps.md
-DefaultDependencies=no
-After=local-fs.target nftables.service
-Before=network-pre.target shutdown.target
-Wants=network-pre.target
-Conflicts=shutdown.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-# The ruleset matches the cgroup user.slice, resolved at load time: create it if systemd has
-# not yet (early boot); systemd adopts the existing directory.
-ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/user.slice
-ExecStart=/usr/sbin/nft -f $EGRESS_RULES
-ExecReload=/usr/sbin/nft -f $EGRESS_RULES
-ExecStop=/usr/sbin/nft delete table inet adk_egress
-
-[Install]
-WantedBy=sysinit.target
-EOF
-then
+egress_units=false
+adk_put_file "$EGRESS_UNIT" 0644 root:root < <(adk_egress_unit "$EGRESS_RULES") && egress_units=true
+# nftables.service flushes the whole ruleset on start/reload: load table adk_egress again then
+adk_put_file "$NFTABLES_DROPIN" 0644 root:root < <(adk_nftables_dropin "$EGRESS_RULES") && egress_units=true
+if [[ "$egress_units" == true ]]; then
   systemctl daemon-reload
   egress_reload=true
 fi

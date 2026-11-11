@@ -22,8 +22,30 @@ setup() {
   HOME_DIR="$T/homes/$ME"
   printf '%s:100000:65536\nother:165536:65536\n%s:300000:10\n' "$ME" "$(id -u)" > "$T/subuid"
   ADK_SUBUID_FILE="$T/subuid"
-  ADK_CI_SCAN_DIRS=("$T/scan")
+  # the wipe needs exactly one range per user
+  printf '%s:100000:65536\nother:165536:65536\n' "$ME" > "$T/subuid1"
+  printf '%s:200000:65536\n' "$ME" > "$T/subgid1"
+  ADK_SUBGID_FILE="$T/subgid1"
+  ADK_CI_TMP_DIRS=("$T/scan")
+  ADK_CI_SPOOL_DIRS=("$T/spool/crontabs")
+  ADK_CI_SCAN_DIRS=("$T/scan" "$T/elsewhere-scan")
   ADK_CI_SCAN_PRUNE=(/proc)
+  mkdir -p "$T/spool/crontabs" "$T/elsewhere-scan"
+  # "as the user": the test user plays user ci (no namespace, see _adk_ci_ns_delete)
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/as-uid.log"\nshift\nexec "$@"\n' "$T" > "$T/as-uid"
+  chmod +x "$T/as-uid"
+  export ADK_AS_UID_HOOK="$T/as-uid"
+}
+
+# wipe_stubs: no real locking, killing or IPC in tests
+wipe_stubs() {
+  adk_user_home() { echo "$HOME_DIR"; }
+  adk_ci_lock() { echo "lock $1" >> "$LOG"; }
+  adk_ci_kill() { echo "kill $1 home-present=$([ -d "$HOME_DIR" ] && echo yes) spool=$(find "$T/spool/crontabs" -mindepth 1 | wc -l)" >> "$LOG"; }
+  _adk_ipc_clean() { echo "ipc $*" >> "$LOG"; }
+  # (the test user, playing ci, of course has processes: bats)
+  _adk_pids_in_ranges() { :; }
+  ADK_SUBUID_FILE="$T/subuid1"
 }
 
 refute() {
@@ -54,13 +76,13 @@ refute() {
   [ "$status" -ne 0 ]
 }
 
-@test "adk_ci_wipe: kills first, then deletes home, state and stray files; recreates both empty" {
-  adk_user_home() { echo "$HOME_DIR"; }
-  adk_ci_kill() { echo "kill $1 home-present=$([ -d "$HOME_DIR" ] && echo yes)" >> "$LOG"; }
+@test "adk_ci_wipe: lock, spools, kill, then deletions; home and state recreated empty" {
+  wipe_stubs
   mkdir -p "$HOME_DIR/.config/systemd/user" "$HOME_DIR/.local/share/docker/image" "$T/state/host"
   printf '[Service]\nExecStart=/bin/evil\n' > "$HOME_DIR/.config/systemd/user/evil.service"
   printf 'evil-image\n' > "$HOME_DIR/.local/share/docker/image/tag"
   printf '{"token":"x"}\n' > "$T/state/.runner"
+  printf '* * * * * /bin/evil\n' > "$T/spool/crontabs/$ME"
   printf 'left\n' > "$T/scan/planted"
   mkdir "$T/scan/dir"; printf 'x\n' > "$T/scan/dir/f"
   # a symlink in the scan dir is removed itself, its target stays
@@ -68,19 +90,98 @@ refute() {
   ln -s "$T/target" "$T/scan/link"
   run adk_ci_wipe "$ME" "$T/state"
   [ "$status" -eq 0 ]
-  [ "$(cat "$LOG")" = "kill $ME home-present=yes" ]
+  [ "$(cat "$LOG")" = "$(printf 'lock %s\nkill %s home-present=yes spool=0\nipc %s-%s 100000-165535' "$ME" "$ME" "$(id -u)" "$(id -u)")" ]
   [ -d "$HOME_DIR" ] && [ -z "$(ls -A "$HOME_DIR")" ]
   [ "$(stat -c %a "$HOME_DIR")" = "700" ]
   [ -d "$T/state" ] && [ -z "$(ls -A "$T/state")" ]
   [ "$(stat -c %a "$T/state")" = "700" ]
   [ -z "$(ls -A "$T/scan")" ]
+  [ -z "$(ls -A "$T/spool/crontabs")" ]
   [ "$(cat "$T/target")" = "keep" ]
-  refute ls -d "$T"/homes/.adk-wipe-* 2> /dev/null
+  # quarantine directories are root-only and empty afterwards
+  [ "$(stat -c %a "$T/homes/.adk-wipe")" = "700" ] && [ -z "$(ls -A "$T/homes/.adk-wipe")" ]
+  [ -z "$(ls -A "$T/.adk-wipe")" ]
+}
+
+@test "adk_ci_wipe: world-writable trees are cleaned AS the user (find -delete), never by root by name" {
+  wipe_stubs
+  mkdir -p "$HOME_DIR"
+  printf 'x\n' > "$T/scan/f"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -eq 0 ]
+  grep -qE "^$ME find $T/scan -xdev -mindepth 1 \\( -uid $(id -u) -o \\( -uid \\+99999 -uid -165536 \\) \\) -delete\$" "$T/as-uid.log"
+  # no rm on single names anywhere in the library
+  refute grep -nE 'rm -rf[^\n]*"\$r"|while IFS= read -r -d' "$ROOT/agent/lib/ci-runner.sh"
+}
+
+@test "adk_ci_wipe: a directory swapped for a symlink between enumeration and deletion never leads outside" {
+  # Deterministic version: the switch to "the user" lists what a name-based deletion would
+  # have seen, then swaps J for a symlink to a directory with the same file names, then lets
+  # the deletion run. A root "rm" on the listed names (the old way) would delete outside/f*.
+  wipe_stubs
+  mkdir -p "$HOME_DIR" "$T/scan/H/J/sub" "$T/outside/sub"
+  for i in 1 2 3; do printf 'job\n' > "$T/scan/H/J/f$i"; printf 'keep\n' > "$T/outside/f$i"; done
+  printf 'job\n' > "$T/scan/H/J/sub/g"; printf 'keep\n' > "$T/outside/sub/g"
+  cat > "$T/swap-hook" <<EOF
+#!/bin/sh
+shift
+find "$T/scan" -mindepth 1 -print > "$T/enumerated"
+mv -T "$T/scan/H/J" "$T/J.moved" && ln -s "$T/outside" "$T/scan/H/J"
+exec "\$@"
+EOF
+  chmod +x "$T/swap-hook"
+  ADK_AS_UID_HOOK="$T/swap-hook"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -eq 0 ]
+  grep -qx "$T/scan/H/J/f1" "$T/enumerated"
+  grep -qx "$T/scan/H/J/sub/g" "$T/enumerated"
+  [ "$(cat "$T/outside/f1" "$T/outside/f2" "$T/outside/f3" "$T/outside/sub/g")" = "$(printf 'keep\nkeep\nkeep\nkeep')" ]
+  # the symlink itself went away, its target stayed
+  [ ! -L "$T/scan/H/J" ]
+}
+
+@test "adk_ci_wipe: a directory swapped for a symlink during the cleanup never leads outside" {
+  # The attack: the agent owns /tmp/H (0777), a job puts its files into /tmp/H/J, and while
+  # the wipe runs the agent swaps J for a symlink to a directory the job must not touch.
+  wipe_stubs
+  mkdir -p "$HOME_DIR" "$T/outside/sub"
+  for i in $(seq 1 40); do printf 'keep\n' > "$T/outside/f$i"; done
+  printf 'keep\n' > "$T/outside/sub/g"
+  H="$T/scan/H"
+  (
+    while [ ! -e "$T/stop" ]; do
+      mkdir -p "$H/D.$$/sub" 2> /dev/null || continue
+      for i in $(seq 1 40); do : > "$H/D.$$/f$i" 2> /dev/null; done
+      : > "$H/D.$$/sub/g" 2> /dev/null
+      ln -sfn "$T/outside" "$H/L.$$" 2> /dev/null
+      mv -T "$H/D.$$" "$H/J" 2> /dev/null
+      mv -T "$H/J" "$H/old.$$" 2> /dev/null && mv -T "$H/L.$$" "$H/J" 2> /dev/null
+      rm -f "$H/J" 2> /dev/null
+      rm -rf "$H/old.$$" "$H/D.$$" 2> /dev/null
+    done
+  ) 3>&- &
+  swapper=$!
+  for n in $(seq 1 30); do
+    adk_ci_wipe "$ME" "$T/state" > /dev/null 2>&1 || true
+  done
+  touch "$T/stop"
+  wait "$swapper" || true
+  [ "$(find "$T/outside" -type f | wc -l)" -eq 41 ]
+}
+
+@test "adk_ci_wipe: a symlink to a directory is never followed by the cleanup" {
+  wipe_stubs
+  mkdir -p "$HOME_DIR" "$T/outside" "$T/scan/H"
+  printf 'keep\n' > "$T/outside/f"
+  ln -s "$T/outside" "$T/scan/H/J"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$T/outside/f")" = "keep" ]
+  [ ! -e "$T/scan/H/J" ] && [ ! -L "$T/scan/H/J" ]
 }
 
 @test "adk_ci_wipe: a symlinked state directory is removed as a link, never followed" {
-  adk_user_home() { echo "$HOME_DIR"; }
-  adk_ci_kill() { :; }
+  wipe_stubs
   mkdir -p "$HOME_DIR" "$T/elsewhere"
   printf 'keep\n' > "$T/elsewhere/file"
   ln -s "$T/elsewhere" "$T/state"
@@ -90,8 +191,48 @@ refute() {
   [ "$(cat "$T/elsewhere/file")" = "keep" ]
 }
 
-@test "adk_ci_wipe stops when processes survive (nothing deleted)" {
-  adk_user_home() { echo "$HOME_DIR"; }
+@test "adk_ci_wipe: a spool directory an unprivileged user could change is refused" {
+  wipe_stubs
+  mkdir -p "$HOME_DIR" "$T/real-spool"
+  printf 'x\n' > "$T/real-spool/$ME"
+  ADK_CI_SPOOL_DIRS=("$T/spool/link")
+  ln -s "$T/real-spool" "$T/spool/link"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"can be changed by an unprivileged user"* ]]
+  [ -f "$T/real-spool/$ME" ]
+  ADK_CI_SPOOL_DIRS=("$T/ww/spool")
+  mkdir -p "$T/ww/spool" && chmod 0777 "$T/ww"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -ne 0 ]
+}
+
+@test "adk_dir_chain_trusted: owner, group and other write, sticky bit, symlinks" {
+  mkdir -p "$T/a/b" "$T/sticky/x" "$T/ww/x"
+  adk_dir_chain_trusted "$T/a/b"
+  adk_dir_chain_trusted /
+  chmod 1777 "$T/sticky"
+  adk_dir_chain_trusted "$T/sticky/x"
+  chmod 0777 "$T/ww"
+  refute adk_dir_chain_trusted "$T/ww/x"
+  ln -s "$T/a" "$T/l"
+  refute adk_dir_chain_trusted "$T/l/b"
+  refute adk_dir_chain_trusted "$T/a/../a/b"
+  refute adk_dir_chain_trusted "relative/path"
+}
+
+@test "adk_ci_wipe: files of the user elsewhere are reported, not removed by root" {
+  wipe_stubs
+  mkdir -p "$HOME_DIR"
+  printf 'x\n' > "$T/elsewhere-scan/survivor"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING: a file of $ME survived the wipe"*"survivor"* ]]
+  [ -f "$T/elsewhere-scan/survivor" ]
+}
+
+@test "adk_ci_wipe stops when processes survive (nothing deleted in the home)" {
+  wipe_stubs
   adk_ci_kill() { return 1; }
   mkdir -p "$HOME_DIR"
   printf 'x\n' > "$HOME_DIR/file"
@@ -101,13 +242,80 @@ refute() {
 }
 
 @test "adk_ci_wipe refuses odd home paths" {
-  adk_ci_kill() { :; }
+  wipe_stubs
   adk_user_home() { echo "/"; }
   run adk_ci_wipe "$ME" "$T/state"
   [ "$status" -ne 0 ]
   adk_user_home() { echo "$T/homes/../x"; }
   run adk_ci_wipe "$ME" "$T/state"
   [ "$status" -ne 0 ]
+}
+
+@test "_adk_ci_ns_prefix: the user is root inside, its subuids/subgids keep their numbers" {
+  ADK_SUBUID_FILE="$T/subuid1"
+  _adk_ci_ns_prefix "$ME"
+  [ "${ADK_NS_PREFIX[*]}" = "unshare --user --map-root-user --map-users=100000:100000:65536 --map-groups=200000:200000:65536 --" ]
+  [ "$ADK_NS_RANGE" = "100000-165535" ]
+  # two ranges or a range below 65536 would make ids ambiguous inside
+  ADK_SUBUID_FILE="$T/subuid"
+  run _adk_ci_ns_prefix "$ME"
+  [ "$status" -ne 0 ]
+  printf '%s:1000:500\n' "$ME" > "$T/low"
+  ADK_SUBUID_FILE="$T/low"
+  run _adk_ci_ns_prefix "$ME"
+  [ "$status" -ne 0 ]
+}
+
+@test "adk_ci_kill: cgroup.kill of the user slice, kill -1 as the user, then by pid; refuses self/root" {
+  run adk_ci_kill "$ME"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing"* ]]
+  run adk_ci_kill root
+  [ "$status" -ne 0 ]
+  # a user other than the caller (stubbed id)
+  id() { if [ "${1:-}" = -u ] && [ "${2:-}" = ci ]; then echo 4242; else command id "$@"; fi; }
+  systemctl() { echo "systemctl $*" >> "$LOG"; }
+  loginctl() { echo "loginctl $*" >> "$LOG"; }
+  _adk_as_uid() { echo "as-uid $*" >> "$LOG"; }
+  # (runs in command substitutions: count in a file) one surviving pid on the first look only
+  _adk_pids_in_ranges() { echo x >> "$T/looks"; [ "$(wc -l < "$T/looks")" -gt 1 ] || echo 999999; }
+  kill() { echo "kill $*" >> "$LOG"; }
+  sleep() { :; }
+  ADK_CGROUP_ROOT="$T/cg"
+  mkdir -p "$T/cg/user.slice/user-4242.slice"
+  : > "$T/cg/user.slice/user-4242.slice/cgroup.kill"
+  printf 'ci:500000:65536\n' > "$T/subuid-ci"
+  ADK_SUBUID_FILE="$T/subuid-ci"
+  run adk_ci_kill ci
+  [ "$status" -eq 0 ]
+  [ "$(cat "$T/cg/user.slice/user-4242.slice/cgroup.kill")" = "1" ]
+  grep -qx "as-uid ci kill -s KILL -- -1" "$LOG"
+  grep -qx "kill -KILL 999999" "$LOG"
+  grep -qx "systemctl stop user@4242.service" "$LOG"
+}
+
+@test "_adk_ipc_clean removes SysV objects owned or created by the ranges, by id" {
+  mkdir -p "$T/ipc"
+  {
+    printf '       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid\n'
+    printf '         0         11   600                  4096   10    10      0  1001  1001  1001  1001\n'
+    printf '         0         12   600                  4096   10    10      0     0     0     0     0\n'
+    printf '         0         13   600                  4096   10    10      0  1000  1000 100005 100005\n'
+  } > "$T/ipc/shm"
+  printf '       key      semid perms      nsems   uid   gid  cuid  cgid\n         0         21   600          1 100000 100000 100000 100000\n' > "$T/ipc/sem"
+  printf '       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid\n         0         31   600           0          0     0     0  1000  1000  1000  1000\n' > "$T/ipc/msg"
+  ipcrm() { echo "ipcrm $*" >> "$LOG"; }
+  ADK_SYSVIPC_DIR="$T/ipc"
+  _adk_ipc_clean 1001-1001 100000-165535
+  [ "$(cat "$LOG")" = "$(printf 'ipcrm -m 11\nipcrm -m 13\nipcrm -s 21')" ]
+}
+
+@test "adk_ci_lock expires the account and drops linger; unlock reverts both" {
+  usermod() { echo "usermod $*" >> "$LOG"; }
+  loginctl() { echo "loginctl $*" >> "$LOG"; }
+  adk_ci_lock ci
+  adk_ci_unlock ci
+  [ "$(cat "$LOG")" = "$(printf 'usermod -L -e 1 ci\nloginctl disable-linger ci\nusermod -e  ci\nloginctl enable-linger ci')" ]
 }
 
 @test "adk_runner_register: fresh token via stdin only, ephemeral, old registrations and tokens invalidated" {
@@ -164,6 +372,26 @@ refute() {
   refute grep -qi 'token' <<< "$output"
 }
 
+@test "runner unit: bound to the egress limits, refuses to start without the table" {
+  run adk_runner_unit 1001
+  [ "$status" -eq 0 ]
+  grep -qx 'Requires=adk-egress.service' <<< "$output"
+  grep -qx 'BindsTo=adk-egress.service' <<< "$output"
+  grep -qE '^After=.*adk-egress.service' <<< "$output"
+  # the table check is the first start step, before prepare
+  [ "$(grep -m1 '^ExecStartPre=' <<< "$output")" = "ExecStartPre=+/bin/sh -c '/usr/sbin/nft list table inet adk_egress > /dev/null'" ]
+}
+
+@test "runner unit: a run ends a little after the job timeout (wipe via ExecStopPost)" {
+  run adk_runner_unit 1001
+  grep -qx "RuntimeMaxSec=$ADK_RUNNER_MAX_RUNTIME" <<< "$output"
+  # runner.yaml has the same job timeout, and the unit limit lies above it
+  grep -qx "  timeout: $ADK_RUNNER_JOB_TIMEOUT" < <(grep -A3 '^runner:' "$ROOT/agent/render-services.sh")
+  job_min=$(( ${ADK_RUNNER_JOB_TIMEOUT%h} * 60 ))
+  max_min=${ADK_RUNNER_MAX_RUNTIME%min}
+  [ "$max_min" -gt "$job_min" ] && [ "$max_min" -le $((job_min + 30)) ]
+}
+
 @test "ci-reset.sh drops the unit's ci environment before acting as root" {
   # The runner unit sets DOCKER_HOST/XDG_RUNTIME_DIR/HOME of user ci; ExecStartPre=+ inherits them.
   run grep -nE '^unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG XDG_RUNTIME_DIR$' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
@@ -171,9 +399,17 @@ refute() {
   grep -qx 'export HOME=/root' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
   grep -qE '^cd /( |$)' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
   # the env reset happens before the first action (load_config / wipe / prepare)
-  first_action="$(grep -nE '^(load_config|adk_ci_wipe|adk_ensure_rootless_docker)' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh" | head -1 | cut -d: -f1)"
+  first_action="$(grep -nE '^(load_config|adk_ci_wipe|adk_ci_unlock|adk_ensure_rootless_docker)' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh" | head -1 | cut -d: -f1)"
   unset_line="$(grep -n '^unset DOCKER_HOST' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh" | cut -d: -f1)"
   [ "$unset_line" -lt "$first_action" ]
   # the job image is pulled through ci's own socket, explicitly
   grep -q 'DOCKER_HOST="unix:///run/user/$(id -u "$ADK_CI_USER")/docker.sock"' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
+}
+
+@test "ci-reset.sh prepare re-enables the account (after the wipe, before rootless Docker)" {
+  f="$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
+  wipe="$(grep -n '^adk_ci_wipe' "$f" | cut -d: -f1)"
+  unlock="$(grep -n '^adk_ci_unlock "$ADK_CI_USER"' "$f" | cut -d: -f1)"
+  docker="$(grep -n '^adk_ensure_rootless_docker' "$f" | cut -d: -f1)"
+  [ "$wipe" -lt "$unlock" ] && [ "$unlock" -lt "$docker" ]
 }

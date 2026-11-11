@@ -16,8 +16,10 @@
 # directory early in root's PATH such as /usr/local for staff) or secrets (shadow, logs).
 ADK_PRIVILEGED_GROUPS=(root sudo staff shadow adm systemd-journal disk kvm docker lxd incus-admin libvirt)
 
+# adk_ensure_unprivileged_user NAME [no-linger]: no-linger leaves linger to the caller (user ci:
+# agent/ci-reset.sh switches it per job)
 adk_ensure_unprivileged_user() {
-  local name="$1" g home
+  local name="$1" linger="${2:-linger}" g home
   if ! id "$name" >/dev/null 2>&1; then
     useradd --create-home --shell /bin/bash --user-group "$name"
     adk_changed "user $name created"
@@ -46,7 +48,9 @@ adk_ensure_unprivileged_user() {
   if ! grep -q "^$name:" /etc/subuid || ! grep -q "^$name:" /etc/subgid; then
     adk_die "$name has no /etc/subuid or /etc/subgid range (needed for rootless Docker)"
   fi
-  if [[ "$(loginctl show-user "$name" -p Linger --value 2>/dev/null)" != "yes" ]]; then
+  if [[ "$linger" == no-linger ]]; then
+    adk_ok "user $name: linger managed per CI job"
+  elif [[ "$(loginctl show-user "$name" -p Linger --value 2>/dev/null)" != "yes" ]]; then
     loginctl enable-linger "$name"
     adk_changed "user $name: linger enabled"
   else
