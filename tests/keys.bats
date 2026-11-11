@@ -14,6 +14,63 @@ setup() {
 
 fp() { ssh-keygen -l -f "$1" | cut -d' ' -f2; }
 
+# --- add-key: key from stdin (default) ----------------------------------------
+
+@test "add-key reads the key from stdin" {
+  run "$ADD" hermes < "$BATS_TEST_TMPDIR/a.pub"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$ADK_AUTH_KEYS_DIR/hermes")" = "$(cat "$BATS_TEST_TMPDIR/a.pub")" ]
+  [[ "$output" == *"added"* ]]
+}
+
+@test "add-key: empty or invalid stdin is refused" {
+  run "$ADD" hermes < /dev/null
+  [ "$status" -eq 1 ]
+  run "$ADD" hermes < "$BATS_TEST_TMPDIR/a"
+  [ "$status" -eq 1 ]
+  [ ! -e "$ADK_AUTH_KEYS_DIR/hermes" ]
+}
+
+@test "add-key: key file in a world-writable directory is refused" {
+  mkdir -m 1777 "$BATS_TEST_TMPDIR/tmp"
+  cp "$BATS_TEST_TMPDIR/a.pub" "$BATS_TEST_TMPDIR/tmp/key.pub"
+  run "$ADD" hermes "$BATS_TEST_TMPDIR/tmp/key.pub"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"world-writable"* ]]
+  [ ! -e "$ADK_AUTH_KEYS_DIR/hermes" ]
+}
+
+@test "add-key: group/other-writable or symlinked key file is refused" {
+  cp "$BATS_TEST_TMPDIR/a.pub" "$BATS_TEST_TMPDIR/w.pub"
+  chmod 0666 "$BATS_TEST_TMPDIR/w.pub"
+  run "$ADD" hermes "$BATS_TEST_TMPDIR/w.pub"
+  [ "$status" -eq 2 ]
+  ln -s "$BATS_TEST_TMPDIR/a.pub" "$BATS_TEST_TMPDIR/l.pub"
+  run "$ADD" hermes "$BATS_TEST_TMPDIR/l.pub"
+  [ "$status" -eq 2 ]
+  [ ! -e "$ADK_AUTH_KEYS_DIR/hermes" ]
+}
+
+@test "add-key: existing file without trailing newline keeps both keys intact" {
+  printf '%s' "$(cat "$BATS_TEST_TMPDIR/a.pub")" > "$ADK_AUTH_KEYS_DIR/hermes"
+  run "$ADD" hermes < "$BATS_TEST_TMPDIR/b.pub"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$ADK_AUTH_KEYS_DIR/hermes")" -eq 2 ]
+  [ "$(sed -n 1p "$ADK_AUTH_KEYS_DIR/hermes")" = "$(cat "$BATS_TEST_TMPDIR/a.pub")" ]
+  [ "$(sed -n 2p "$ADK_AUTH_KEYS_DIR/hermes")" = "$(cat "$BATS_TEST_TMPDIR/b.pub")" ]
+}
+
+@test "add-key: concurrent runs lose no key (lock)" {
+  for i in 1 2 3 4 5 6 7 8; do
+    ssh-keygen -q -t ed25519 -N '' -C "k$i@example.com" -f "$BATS_TEST_TMPDIR/k$i"
+  done
+  for i in 1 2 3 4 5 6 7 8; do
+    "$ADD" hermes < "$BATS_TEST_TMPDIR/k$i.pub" > /dev/null &
+  done
+  wait
+  [ "$(wc -l < "$ADK_AUTH_KEYS_DIR/hermes")" -eq 8 ]
+}
+
 @test "add-key writes the key to the user's file" {
   run "$ADD" hermes "$BATS_TEST_TMPDIR/a.pub"
   [ "$status" -eq 0 ]
@@ -53,10 +110,12 @@ fp() { ssh-keygen -l -f "$1" | cut -d' ' -f2; }
   [ ! -e "$ADK_AUTH_KEYS_DIR/hermes" ]
 }
 
-@test "add-key: missing key file is a usage error" {
+@test "add-key: missing key file or extra arguments are usage errors" {
   run "$ADD" hermes "$BATS_TEST_TMPDIR/nope.pub"
   [ "$status" -eq 2 ]
-  run "$ADD" hermes
+  run "$ADD" hermes "$BATS_TEST_TMPDIR/a.pub" extra
+  [ "$status" -eq 2 ]
+  run "$ADD"
   [ "$status" -eq 2 ]
 }
 
@@ -109,4 +168,31 @@ fp() { ssh-keygen -l -f "$1" | cut -d' ' -f2; }
   run "$ADD" hermes "$BATS_TEST_TMPDIR/a.pub"
   [ "$status" -eq 2 ]
   [[ "$output" == *"root"* ]]
+}
+
+@test "remove-key counts only valid keys as remaining admin keys" {
+  "$ADD" adk-admin < "$BATS_TEST_TMPDIR/a.pub"
+  printf 'not-a-key at all\n' >> "$ADK_AUTH_KEYS_DIR/adk-admin"
+  run "$REMOVE" adk-admin "$(fp "$BATS_TEST_TMPDIR/a.pub")"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"last"* ]]
+}
+
+@test "remove-key --terminate ends the user's sessions" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  for c in loginctl systemctl; do
+    # shellcheck disable=SC2016  # expanded by the fake command
+    printf '#!/bin/sh\necho "%s $*" >> "%s"\n[ "$1" = show-user ] && echo yes\nexit 0\n' \
+      "$c" "$BATS_TEST_TMPDIR/calls.log" > "$BATS_TEST_TMPDIR/bin/$c"
+    chmod +x "$BATS_TEST_TMPDIR/bin/$c"
+  done
+  "$ADD" hermes < "$BATS_TEST_TMPDIR/a.pub"
+  "$ADD" hermes < "$BATS_TEST_TMPDIR/b.pub"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH" run "$REMOVE" hermes "$(fp "$BATS_TEST_TMPDIR/b.pub")"
+  [ "$status" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/calls.log" ]
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH" run "$REMOVE" --terminate hermes "$(fp "$BATS_TEST_TMPDIR/a.pub")"
+  [ "$status" -eq 0 ]
+  grep -qx "loginctl terminate-user hermes" "$BATS_TEST_TMPDIR/calls.log"
+  [[ "$output" == *"crontab"* ]]
 }

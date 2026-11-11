@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SSH public key validation shared by the agent-dev-kit scripts.
 #
-#   adk_read_pubkey FILE      print the key as one normalized line "type base64 [comment]";
-#                             on failure print the reason to stderr and return 1
+#   adk_read_pubkey FILE|-    print the key as one normalized line "type base64 [comment]";
+#                             "-" reads stdin (max 64 KiB); on failure print the reason
+#                             to stderr and return 1 (2: file not readable)
 #   adk_pubkey_material LINE  print "type base64" (identity of a key, comment ignored)
 #   adk_pubkey_fingerprint LINE  print the SHA256 fingerprint of a key line
 #
@@ -30,11 +31,15 @@ adk_pubkey_material() {
 adk_read_pubkey() {
   local file="$1" content line="" n=0 l bits
   local LC_ALL=C   # [[:print:]] must not match non-ASCII
-  if [[ ! -f "$file" || ! -r "$file" ]]; then
+  if [[ "$file" == - ]]; then
+    file="stdin"
+    content="$(head -c 65536 | tr -d '\r')"
+  elif [[ ! -f "$file" || ! -r "$file" ]]; then
     echo "ERROR: cannot read public key file: $file" >&2
     return 2
+  else
+    content="$(tr -d '\r' < "$file")"
   fi
-  content="$(tr -d '\r' < "$file")"
   if [[ "$content" == *"PRIVATE KEY"* ]]; then
     echo "ERROR: $file is a private key; pass the .pub file" >&2
     return 1

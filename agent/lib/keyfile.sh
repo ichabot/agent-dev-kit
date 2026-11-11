@@ -41,3 +41,35 @@ adk_write_keys_file() {
   if [[ "$(id -u)" -eq 0 ]]; then chown root:root "$tmp"; fi
   mv -f "$tmp" "$file"
 }
+
+# adk_lock_keys_dir: exclusive lock on the keys directory (fd 9) for the rest of the script,
+# so concurrent add/remove runs cannot lose each other's changes.
+adk_lock_keys_dir() {
+  exec 9< "$(adk_keys_dir)"
+  if ! flock -w 30 9; then
+    echo "ERROR: $(adk_keys_dir) is locked by another add-key/remove-key run" >&2
+    return 1
+  fi
+}
+
+# adk_check_key_source PATH OPENED: a key file passed as argument must belong to root, the
+# invoking admin ($SUDO_UID) or the caller, must not be group/other-writable, and neither
+# may its directory. OPENED is the already opened file (/proc/<pid>/fd/<n>).
+adk_check_key_source() {
+  local path="$1" opened="$2" dir f_uid f_mode d_uid d_mode
+  dir="$(dirname "$path")"
+  read -r f_uid f_mode < <(stat -L -c '%u %a' "$opened")
+  read -r d_uid d_mode < <(stat -L -c '%u %a' "$dir")
+  if ! _adk_trusted_uid "$f_uid" || (((8#$f_mode & 8#022) != 0)); then
+    echo "ERROR: $path must be owned by root or you and not group/other-writable; pipe the key on stdin instead" >&2
+    return 1
+  fi
+  if ! _adk_trusted_uid "$d_uid" || (((8#$d_mode & 8#022) != 0)); then
+    echo "ERROR: $path is in a group/world-writable or foreign directory ($dir); pipe the key on stdin instead" >&2
+    return 1
+  fi
+}
+
+_adk_trusted_uid() {
+  [[ "$1" == 0 || "$1" == "$(id -u)" || ( -n "${SUDO_UID:-}" && "$1" == "$SUDO_UID" ) ]]
+}
