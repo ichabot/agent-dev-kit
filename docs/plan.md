@@ -43,7 +43,8 @@ der vorhandene Daten nie ohne Freigabe ändert. Nach der Übergabe gehört alles
 | PR | Inhalt | KI-Tage |
 |---|---|---|
 | 1 | Kit-Gerüst, Platzhalter-Datei, Prüfskript, Spike Hermes-Desktop-Remote | 0,5 |
-| 2 | Agent-VPS: Hetzner-Firewall, Cloud-Init, Hermes, Gitea + Runner, Caddy, Backups | 1,5 |
+| 2a | Agent-VPS Basis: Hetzner-Firewall, Cloud-Init, Bootstrap, sshd-Härtung, rootless Docker, Hermes | 0,75 |
+| 2b | Agent-VPS Dienste: Gitea, CI-Runner (rootless), Caddy/TLS, Backup + Restore | 1 |
 | 3 | TEST-VM: Firewall, Cloud-Init, Docker, Caddy, Deploy-User mit Zwangsbefehl | 0,5 |
 | 4 | Projekt-Vorlage: Deployment-Vertrag, `update.sh`, Migrations-Lint, CI mit Upgrade-Test | 2 |
 | 5 | Kunden-Hermes: SOUL.md, Skills, Token-Tuning, Kunden-Doku, Übergabe-Checkliste | 1 |
@@ -76,7 +77,11 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 
 **Abnahme:** `make check` grün; Spike-Ergebnis dokumentiert.
 
-## PR 2 – Agent-VPS
+## PR 2 – Agent-VPS (aufgeteilt in 2a Basis und 2b Dienste)
+
+**Aufteilung:** 2a = Firewall, Server, Cloud-Init, Bootstrap, sshd, Users, rootless Docker, Hermes. 2b = Gitea, Runner, Caddy, Backup/Restore.
+
+**Zusatz aus Review:** Der CI-Runner läuft mit rootless Docker eines eigenen Users `ci` – ein Runner am root-Docker-Socket würde Agent-Code über CI-Jobs root-Rechte geben. Während des Setups bekommt die Admin-IP des Einrichters eine eigene SSH-Regel (`--admin-source`), die bei der Übergabe entfernt wird.
 
 **Security-Gate:** Exponiert SSH, Gitea (443), VPN – alles nur für `CUSTOMER_IPS` (Hetzner Cloud Firewall) und zusätzlich nur an den nötigen Interfaces gebunden. Ausgehend offen (LLM-API, Pakete, ACME). Blast-Radius Agent: User `hermes` ohne root/Docker-Gruppe; Gitea-Bot `agent-bot` ohne Admin, `main` geschützt (Merge nur nach Freigabe durch Mitarbeiter-Account).
 
