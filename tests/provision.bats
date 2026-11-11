@@ -53,7 +53,16 @@ no_match() {
   run "$PROV" --config "$CFG" --pubkey "$KEY.pub" --dry-run
   [ "$status" -eq 0 ]
   got="$(grep -oE '^(GET|POST) [^ ]+' <<< "$output" | tr '\n' ';')"
-  [ "$got" = "GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;GET /firewalls?name=adk-acme-agent;GET /servers?name=adk-acme-agent;POST /ssh_keys;POST /firewalls;POST /servers;POST /servers/<id>/actions/enable_backup;" ]
+  [ "$got" = "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;POST /ssh_keys;POST /firewalls;POST /servers;POST /servers/<id>/actions/enable_backup;" ]
+}
+
+@test "dry-run without --pubkey: only firewall and backups, server must exist" {
+  rm "$HCLOUD_TOKEN_FILE"
+  run "$PROV" --config "$CFG" --dry-run
+  [ "$status" -eq 0 ]
+  got="$(grep -oE '^(GET|POST) [^ ]+' <<< "$output" | tr '\n' ';')"
+  [ "$got" = "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;POST /firewalls;POST /servers/<id>/actions/enable_backup;" ]
+  [[ "$output" == *"must exist"* ]]
 }
 
 @test "dry-run: server is created with firewall attached, labels and debian-13" {
@@ -117,8 +126,6 @@ no_match() {
 }
 
 @test "usage errors exit 2" {
-  run "$PROV" --config "$CFG" --dry-run
-  [ "$status" -eq 2 ]
   run "$PROV" --config "$CFG" --pubkey "$KEY.pub" --frobnicate
   [ "$status" -eq 2 ]
   run "$PROV" --config "$CFG" --pubkey "$BATS_TEST_TMPDIR/nope.pub" --dry-run
@@ -143,6 +150,15 @@ no_match() {
   [ ! -s "$FAKE_ARGV" ]
 }
 
+@test "token file owned by someone else is refused" {
+  [ "$(id -u)" -eq 0 ] && skip "running as root"
+  [ -f /etc/hostname ] || skip "no root-owned file to point at"
+  HCLOUD_TOKEN_FILE=/etc/hostname run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"owned"* ]]
+  [ ! -s "$FAKE_ARGV" ]
+}
+
 @test "token with odd characters is refused (header injection)" {
   (umask 077; printf 'abc\r\nX-Evil: 1\n' > "$HCLOUD_TOKEN_FILE")
   run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
@@ -156,7 +172,7 @@ no_match() {
   FAKE_STATE=empty run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
   [ "$status" -eq 0 ]
   got="$(cut -d' ' -f1,2 "$FAKE_LOG" | tr '\n' ';')"
-  [[ "$got" == "GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;GET /firewalls?name=adk-acme-agent;GET /servers?name=adk-acme-agent;POST /ssh_keys;POST /firewalls;POST /servers;GET /actions/44;GET /servers/33;POST /servers/33/actions/enable_backup;GET /actions/45;"* ]]
+  [[ "$got" == "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;POST /ssh_keys;POST /firewalls;POST /servers;GET /actions/44;GET /servers/33;POST /servers/33/actions/enable_backup;GET /actions/45;"* ]]
   srv="$(grep -m1 '^POST /servers ' "$FAKE_LOG")"
   srv="${srv#POST /servers }"
   [ "$(j "$srv" 'd["firewalls"]')" = "[{'firewall': 22}]" ]
@@ -164,7 +180,7 @@ no_match() {
   [[ "$(j "$srv" 'd["user_data"]')" == "#cloud-config"*"PermitOpen 127.0.0.1:*"* ]]
   [[ "$output" == *"203.0.113.50"* ]]
   [[ "$output" == *"2001:db8:5::1"* ]]
-  [[ "$output" == *"bootstrap.sh 203.0.113.50"* ]]
+  [[ "$output" == *"bootstrap.sh --identity"*" 203.0.113.50"* ]]
 }
 
 @test "token is passed via header file, never in argv or output" {
@@ -176,13 +192,113 @@ no_match() {
   grep -q -- '-H @' "$FAKE_ARGV"
 }
 
+@test "curl gets -q first (no ~/.curlrc can add -v or --trace)" {
+  FAKE_STATE=empty run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 0 ]
+  [ -s "$FAKE_ARGV" ]
+  no_match -v '^-q ' "$FAKE_ARGV"
+}
+
 @test "existing setup: idempotent, only the firewall rules are re-applied" {
   FAKE_STATE=existing run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
   [ "$status" -eq 0 ]
   no_match -E '^POST /(ssh_keys|firewalls|servers) ' "$FAKE_LOG"
   no_match 'enable_backup' "$FAKE_LOG"
+  no_match 'apply_to_resources' "$FAKE_LOG"
   grep -q '^POST /firewalls/22/actions/set_rules ' "$FAKE_LOG"
   [[ "$output" == *"203.0.113.50"* ]]
+}
+
+@test "existing server without --pubkey (handover): no ssh key requests at all" {
+  FAKE_STATE=existing run "$PROV" --config "$CFG"
+  [ "$status" -eq 0 ]
+  no_match 'ssh_keys' "$FAKE_LOG"
+  grep -q '^POST /firewalls/22/actions/set_rules ' "$FAKE_LOG"
+}
+
+@test "missing server without --pubkey: refused before any change" {
+  FAKE_STATE=empty run "$PROV" --config "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--pubkey"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "existing server without the kit firewall: firewall is applied" {
+  FAKE_STATE=nofw run "$PROV" --config "$CFG"
+  [ "$status" -eq 0 ]
+  b="$(grep -m1 '^POST /firewalls/22/actions/apply_to_resources ' "$FAKE_LOG")"
+  b="${b#POST /firewalls/22/actions/apply_to_resources }"
+  [ "$(j "$b" 'd["apply_to"]')" = "[{'type': 'server', 'server': {'id': 33}}]" ]
+  grep -q '^GET /actions/47$' "$FAKE_LOG"
+  [[ "$output" == *"firewall applied"* ]]
+}
+
+@test "existing server without backups: backups are enabled" {
+  FAKE_STATE=nobackup run "$PROV" --config "$CFG"
+  [ "$status" -eq 0 ]
+  grep -q '^POST /servers/33/actions/enable_backup$' "$FAKE_LOG"
+  grep -q '^GET /actions/45$' "$FAKE_LOG"
+}
+
+@test "a second firewall on the server is refused (Hetzner adds up allow rules)" {
+  FAKE_STATE=extrafw run "$PROV" --config "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"99"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "server labelled for another customer is not touched" {
+  FAKE_STATE=othercustomer run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"customer"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "firewall with the kit's name but without label is not touched" {
+  FAKE_STATE=fwforeign run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"managed-by"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "same key uploaded under another name is reused" {
+  FAKE_STATE=fpreuse run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 0 ]
+  no_match '^POST /ssh_keys' "$FAKE_LOG"
+  srv="$(grep -m1 '^POST /servers ' "$FAKE_LOG")"
+  srv="${srv#POST /servers }"
+  [ "$(j "$srv" 'd["ssh_keys"]')" = "[12]" ]
+  [[ "$output" == *"laptop"* ]]
+}
+
+@test "failed action is reported" {
+  FAKE_STATE=actionerror run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"action 44 failed: boom"* ]]
+}
+
+@test "action that never finishes times out" {
+  ADK_POLL_MAX=3 FAKE_STATE=actiontimeout run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not finish"* ]]
+  [ "$(grep -c '^GET /actions/44$' "$FAKE_LOG")" -eq 3 ]
+}
+
+@test "non-JSON API response: clear error, no traceback" {
+  FAKE_STATE=html run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"502"* ]]
+  [[ "$output" == *"not JSON"* ]]
+  [[ "$output" != *"Traceback"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "non-numeric id from the API is never used in a path" {
+  FAKE_STATE=badid run "$PROV" --config "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"id"* ]]
+  no_match '\.\.' "$FAKE_LOG"
+  no_match '^POST' "$FAKE_LOG"
 }
 
 @test "server with the same name but not managed by the kit is not touched" {

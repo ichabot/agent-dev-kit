@@ -3,8 +3,23 @@
 agent/provision.sh. Never touches the network.
 
 Env: FAKE_LOG (requests, one "METHOD PATH BODY" line each), FAKE_ARGV (argv per call),
-FAKE_STATE (empty | existing | foreign | badkey | unauthorized), FAKE_FP (MD5 fingerprint
-of the test key without "MD5:"), FAKE_TOKEN (expected bearer token).
+FAKE_FP (MD5 fingerprint of the test key without "MD5:"), FAKE_TOKEN (expected bearer
+token), FAKE_STATE:
+  empty          nothing exists
+  existing       key, firewall and server (firewall attached, backups on)
+  nofw           server without the kit firewall attached (apply_to_resources)
+  nobackup       server exists, backups off
+  extrafw        server has a second, foreign firewall attached
+  othercustomer  server labelled for another customer
+  foreign        server without the managed-by label
+  fwforeign      firewall with the kit's name but without labels
+  badkey         ssh key name taken by a different key
+  fpreuse        same key already uploaded under another name
+  actionerror    the server create action fails
+  actiontimeout  actions never finish
+  html           the API answers with a non-JSON body (proxy error page)
+  badid          the server id in the response is not a number
+  unauthorized   every request gets 401
 """
 import json
 import os
@@ -41,14 +56,30 @@ with open(os.environ["FAKE_LOG"], "a") as f:
 state = os.environ.get("FAKE_STATE", "empty")
 fp = os.environ.get("FAKE_FP", "")
 labels = {"managed-by": "agent-dev-kit", "customer": "acme"}
-server = {"id": 33, "name": "adk-acme-agent", "labels": labels, "backup_window": None,
+server = {"id": 33, "name": "adk-acme-agent", "labels": labels, "backup_window": "22-02",
           "public_net": {"ipv4": {"ip": "203.0.113.50"}, "ipv6": {"ip": "2001:db8:5::/64"},
                          "firewalls": [{"id": 22, "status": "applied"}]}}
+if state == "nofw":
+    server["public_net"] = dict(server["public_net"], firewalls=[])
+if state == "extrafw":
+    server["public_net"] = dict(server["public_net"],
+                                firewalls=[{"id": 22, "status": "applied"}, {"id": 99, "status": "applied"}])
+if state == "othercustomer":
+    server["labels"] = {"managed-by": "agent-dev-kit", "customer": "other"}
+if state == "foreign":
+    server["labels"] = {}
+if state == "badid":
+    server["id"] = "33/../../ssh_keys"
+SERVER_EXISTS = state in ("existing", "nofw", "nobackup", "extrafw", "othercustomer", "foreign", "badid")
+FIREWALL_EXISTS = SERVER_EXISTS or state == "fwforeign"
 
 
 def respond(code, data):
     with open(out, "w") as f:
-        json.dump(data, f)
+        if isinstance(data, str):
+            f.write(data)
+        else:
+            json.dump(data, f)
     sys.stdout.write(str(code))
     sys.exit(0)
 
@@ -56,36 +87,48 @@ def respond(code, data):
 if f"Authorization: Bearer {os.environ.get('FAKE_TOKEN')}" not in headers or state == "unauthorized":
     respond(401, {"error": {"code": "unauthorized", "message": "unable to authenticate"}})
 
+if state == "html" and path.startswith("/servers?name="):
+    respond(502, "<html><body>502 Bad Gateway</body></html>")
+
 if method == "GET" and path.startswith("/ssh_keys?name="):
-    if state in ("existing", "foreign"):
+    if SERVER_EXISTS:
         respond(200, {"ssh_keys": [{"id": 11, "name": "adk-acme-installer", "fingerprint": fp}]})
     if state == "badkey":
         respond(200, {"ssh_keys": [{"id": 11, "name": "adk-acme-installer", "fingerprint": "00:11"}]})
     respond(200, {"ssh_keys": []})
 if method == "GET" and path.startswith("/ssh_keys?fingerprint="):
+    if state == "fpreuse":
+        respond(200, {"ssh_keys": [{"id": 12, "name": "laptop", "fingerprint": fp}]})
     respond(200, {"ssh_keys": []})
 if method == "POST" and path == "/ssh_keys":
     respond(201, {"ssh_key": {"id": 11, "name": "adk-acme-installer", "fingerprint": fp}})
 if method == "GET" and path.startswith("/firewalls?name="):
-    if state in ("existing", "foreign"):
+    if state == "fwforeign":
+        respond(200, {"firewalls": [{"id": 22, "name": "adk-acme-agent", "labels": {}}]})
+    if FIREWALL_EXISTS:
         respond(200, {"firewalls": [{"id": 22, "name": "adk-acme-agent", "labels": labels}]})
     respond(200, {"firewalls": []})
 if method == "POST" and path == "/firewalls":
     respond(201, {"firewall": {"id": 22, "name": "adk-acme-agent", "labels": labels}, "actions": []})
 if method == "POST" and path == "/firewalls/22/actions/set_rules":
     respond(201, {"actions": [{"id": 46, "status": "running"}]})
+if method == "POST" and path == "/firewalls/22/actions/apply_to_resources":
+    respond(201, {"actions": [{"id": 47, "status": "running"}]})
 if method == "GET" and path.startswith("/servers?name="):
-    if state == "existing":
-        respond(200, {"servers": [dict(server, backup_window="22-02")]})
-    if state == "foreign":
-        respond(200, {"servers": [dict(server, labels={})]})
+    if SERVER_EXISTS:
+        respond(200, {"servers": [server]})
     respond(200, {"servers": []})
 if method == "POST" and path == "/servers":
-    respond(201, {"server": server, "action": {"id": 44, "status": "running"}})
+    respond(201, {"server": dict(server, backup_window=None), "action": {"id": 44, "status": "running"}})
 if method == "GET" and path == "/servers/33":
-    respond(200, {"server": dict(server, backup_window="22-02" if state == "existing" else None)})
+    respond(200, {"server": dict(server, backup_window=None if state in ("empty", "nobackup", "fpreuse") else "22-02")})
 if method == "POST" and path == "/servers/33/actions/enable_backup":
     respond(201, {"action": {"id": 45, "status": "running"}})
 if method == "GET" and path.startswith("/actions/"):
-    respond(200, {"action": {"id": int(path.rsplit("/", 1)[1]), "status": "success"}})
+    action_id = int(path.rsplit("/", 1)[1])
+    if state == "actionerror" and action_id == 44:
+        respond(200, {"action": {"id": 44, "status": "error", "error": {"code": "x", "message": "boom"}}})
+    if state == "actiontimeout":
+        respond(200, {"action": {"id": action_id, "status": "running"}})
+    respond(200, {"action": {"id": action_id, "status": "success"}})
 respond(404, {"error": {"code": "not_found", "message": f"fake: no route {method} {path}"}})
