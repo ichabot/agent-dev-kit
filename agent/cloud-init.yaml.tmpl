@@ -1,0 +1,47 @@
+#cloud-config
+# agent-dev-kit: first boot of the agent VPS. Rendered by agent/render-cloud-init.sh;
+# placeholders are replaced there. Everything heavier (Docker, users, Hermes) is done by
+# agent/setup.sh, which can be re-run; this file only makes the box reachable and safe.
+
+disable_root: true
+ssh_pwauth: false
+
+# No distribution default user: only the admin user exists.
+users:
+  - name: adk-admin
+    gecos: agent-dev-kit admin
+    shell: /bin/bash
+    groups: [sudo]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+
+# Only files no package owns (pitfall: a package conffile written before the package is
+# installed breaks its dpkg configure step).
+write_files:
+  - path: /etc/ssh/authorized_keys/adk-admin
+    owner: root:root
+    permissions: '0644'
+    content: |
+      @@ADMIN_PUBKEY@@
+  - path: /etc/ssh/sshd_config.d/10-adk.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+@@SSHD_DROPIN@@
+
+package_update: true
+package_upgrade: true
+packages:
+  - python3
+  - libatomic1
+  - curl
+  - git
+  - ca-certificates
+  - rsync
+
+runcmd:
+  - install -d -m 0755 -o root -g root /etc/ssh/authorized_keys
+  - chown root:root /etc/ssh/authorized_keys/adk-admin
+  - chmod 0644 /etc/ssh/authorized_keys/adk-admin
+  # Debian 13: reload does not apply drop-in changes reliably, restart does.
+  - sshd -t && systemctl restart ssh
