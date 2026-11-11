@@ -19,8 +19,13 @@ setup() {
     --email anna@example.com --admin --must-change-password=true > /dev/null
   python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p))
 s["repos"]["acme/demo"] = {"default_branch": "main", "branch_protections": [], "tag_protections": []}
+# teams of the organization (gitea-init.sh), not "all repositories"
+for i, (name, perm) in enumerate((("Owners", "owner"), ("developers", "write"), ("readers", "read"))):
+    s["teams"][str(50 + i)] = {"id": 50 + i, "org": "acme", "name": name, "members": [],
+                               "includes_all_repositories": name == "Owners", "permission": perm}
 json.dump(s, open(p, "w"))' "$FAKE_STATE"
   : > "$FAKE_LOG"
+  export ADK_GITEA_LOCK="$BATS_TEST_TMPDIR/gitea-admin.lock"
 }
 
 st() {
@@ -125,4 +130,39 @@ json.dump(s, open(p, "w"))' "$FAKE_STATE"
   run env -u ADK_TEST_PASSWORD_FILE "$PROTECT" --config "$CFG" acme/demo
   [ "$status" -eq 2 ]
   [[ "$output" == *"run as root"* ]]
+}
+
+@test "teams developers and readers get access only after the protection is in place" {
+  run "$PROTECT" --config "$CFG" acme/demo
+  [ "$status" -eq 0 ]
+  [ "$(st 's["repos"]["acme/demo"]["teams"]')" = "['developers', 'readers']" ]
+  last_protect="$(grep -nE '^API (POST|PATCH) /repos/acme/demo/(branch|tag)_protections' "$FAKE_LOG" | tail -n 1 | cut -d: -f1)"
+  first_team="$(grep -n '^API PUT /repos/acme/demo/teams/' "$FAKE_LOG" | head -n 1 | cut -d: -f1)"
+  [ "$last_protect" -lt "$first_team" ]
+  # the final check of the protection lies in between too
+  check="$(grep -n '^API GET /repos/acme/demo/tag_protections' "$FAKE_LOG" | tail -n 1 | cut -d: -f1)"
+  [ "$check" -lt "$first_team" ]
+  run "$PROTECT" --config "$CFG" acme/demo
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ok: acme/demo: team developers has access"* ]]
+  [[ "$output" != *changed* ]]
+}
+
+@test "no team access when the protection cannot be completed" {
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p))
+s["repos"]["acme/demo"]["tag_protections"] = [{"id": 7, "name_pattern": "v*", "whitelist_usernames": ["agent-bot"], "whitelist_teams": []}]
+json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  run "$PROTECT" --config "$CFG" acme/demo
+  [ "$status" -ne 0 ]
+  [ "$(st 's["repos"]["acme/demo"].get("teams", [])')" = "[]" ]
+  refute grep -q '^API PUT /repos/acme/demo/teams/' "$FAKE_LOG"
+}
+
+@test "a missing organization team is an error (gitea-init.sh first)" {
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p))
+s["teams"] = {k: t for k, t in s["teams"].items() if t["name"] != "readers"}
+json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  run "$PROTECT" --config "$CFG" acme/demo
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot give team readers access"* ]]
 }

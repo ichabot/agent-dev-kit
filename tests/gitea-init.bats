@@ -26,6 +26,7 @@ exec "$@"
 EOF
   chmod +x "$BATS_TEST_TMPDIR/as-user"
   export ADK_AS_USER_HOOK="$BATS_TEST_TMPDIR/as-user"
+  export ADK_GITEA_LOCK="$BATS_TEST_TMPDIR/gitea-admin.lock"
 }
 
 # st PYTHON_EXPR: evaluate an expression over the fake Gitea state (variable s)
@@ -74,7 +75,7 @@ refute() {
   done
   [ "$(st 's["orgs"]["acme"]["visibility"]')" = "private" ]
   [ "$(st '[(t["name"], t["permission"], t["can_create_org_repo"], t["includes_all_repositories"]) for t in s["teams"].values() if t["name"] != "Owners"]')" \
-    = "[('developers', 'write', False, True), ('readers', 'read', False, True)]" ]
+    = "[('developers', 'write', False, False), ('readers', 'read', False, False)]" ]
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "developers"]')" = "[['agent-bot']]" ]
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "readers"]')" = "[['prod-pull']]" ]
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "Owners"]')" = "[['anna.mueller']]" ]
@@ -279,4 +280,51 @@ json.dump(s, open(p, "w"))' "$FAKE_STATE"
   [ "$(cat "$HERMES_HOME/.config/gitea/token")" != "$old" ]
   [ "$(st '[t["scopes"] for t in s["tokens"] if t["user"] == "agent-bot"]')" \
     = "['write:repository,write:issue,read:user,read:organization,read:package']" ]
+}
+
+@test "teams do not include all repositories: a new repository is not writable for agent-bot" {
+  "$INIT" --config "$CFG" > /dev/null
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p))
+for t in s["teams"].values():
+    if t["name"] == "developers": t["includes_all_repositories"] = True
+json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"changed: team developers reset"* ]]
+  [ "$(st '[t["includes_all_repositories"] for t in s["teams"].values() if t["name"] == "developers"]')" = "[False]" ]
+}
+
+@test "an unprotected repository loses team developers; a protected one without teams is reported" {
+  "$INIT" --config "$CFG" > /dev/null
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p))
+good = [{"rule_name": "main", "enable_push": False, "enable_force_push": False, "enable_merge_whitelist": True,
+         "enable_bypass_allowlist": False, "dismiss_stale_approvals": True, "block_on_rejected_reviews": True,
+         "enable_approvals_whitelist": True, "required_approvals": 1,
+         "merge_whitelist_usernames": ["anna.mueller"], "approvals_whitelist_username": ["anna.mueller"]}]
+tags = [{"id": 99, "name_pattern": "*", "whitelist_usernames": ["anna.mueller"], "whitelist_teams": []}]
+s["repos"]["acme/open"] = {"default_branch": "main", "branch_protections": [], "tag_protections": [], "teams": ["developers", "readers"]}
+s["repos"]["acme/safe"] = {"default_branch": "main", "branch_protections": good, "tag_protections": tags, "teams": []}
+json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"changed: acme/open: team developers removed"* ]]
+  [ "$(st 's["repos"]["acme/open"]["teams"]')" = "['readers']" ]
+  [[ "$output" == *"WARNING: acme/safe is protected, but team(s) developers readers have no access yet"* ]]
+  # nothing is added by gitea-init itself
+  [ "$(st 's["repos"]["acme/safe"]["teams"]')" = "[]" ]
+}
+
+@test "kit scripts with admin access run one at a time (lock), each deletes its own token" {
+  flock "$ADK_GITEA_LOCK" sleep 5 &
+  holder=$!
+  sleep 0.5
+  ADK_GITEA_LOCK_WAIT=1 run "$INIT" --config "$CFG"
+  kill "$holder" 2> /dev/null || true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"another kit script is using the Gitea admin access"* ]]
+  [ "$(st 'len([t for t in s["tokens"] if t["name"].startswith("adk-init-")])')" = "0" ]
+  wait "$holder" 2> /dev/null || true
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  grep -qE "^sqlite3 .*DELETE FROM access_token WHERE name = 'adk-init-[0-9]{14}-[0-9]+-[0-9]+';" "$FAKE_LOG"
 }

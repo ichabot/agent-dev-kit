@@ -15,6 +15,8 @@
 # list. Tags: rule "*" - only GITEA_ADMIN_USER may create or delete tags (agent-bot and CI
 # jobs cannot push a release tag). Settings that differ are reset; other tag rules that let
 # more users tag are reported (remove them in the repository settings).
+# Only when all of that is in place (checked again at the end) the teams developers (agent-bot)
+# and readers (prod-pull) get access to the repository: before, agent-bot cannot push there.
 #
 # Uses a temporary admin token of GITEA_ADMIN_USER (lib/gitea-admin.sh: stdin only, deleted
 # at the end). Exit codes: 0 = protected, 1 = failure, 2 = usage.
@@ -155,4 +157,17 @@ fi
 
 problems="$(adk_protection_problems "$REPO" "$ADMIN")"
 [[ -z "$problems" ]] || { printf '%s\n' "$problems" >&2; adk_die "$REPO is still not protected as required (see above)"; }
+
+# --- team access: only now that the repository is protected -------------------------------
+echo "== $REPO: team access"
+teams="$(adk_repo_teams "$REPO")"
+for team in "${ADK_REPO_TEAMS[@]}"; do
+  if grep -qx "$team" <<< "$teams"; then
+    adk_ok "$REPO: team $team has access"
+    continue
+  fi
+  api PUT "/repos/$REPO/teams/$team"
+  [[ "$API_CODE" == 204 ]] || adk_die "cannot give team $team access to $REPO (HTTP $API_CODE): $API_BODY (run gitea-init.sh first)"
+  adk_changed "$REPO: team $team has access now"
+done
 echo "protect-repo done: $REPO"

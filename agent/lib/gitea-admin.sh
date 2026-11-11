@@ -5,10 +5,16 @@
 # deleted again by adk_gitea_admin_end (call it from an EXIT trap).
 # Requires host.sh sourced. Names used in SQL are validated by check-config.sh / the callers.
 #
-# Test overrides (non-root only, see tests/gitea-init.bats): ADK_TEST_PASSWORD_FILE.
+# Test overrides (non-root only, see tests/gitea-init.bats): ADK_TEST_PASSWORD_FILE,
+# ADK_GITEA_LOCK, ADK_GITEA_LOCK_WAIT.
 
 ADK_GITEA_COMPOSE_FILE=/opt/adk/services/compose.yaml
 ADK_GITEA_PASSWORD_FILE=/root/adk-gitea-initial-password
+# One kit script with admin access at a time (gitea-init.sh, protect-repo.sh): a second run
+# waits. /run is root-only writable (never /run/lock or /tmp: others could plant a symlink).
+ADK_GITEA_LOCK="${ADK_GITEA_LOCK:-/run/adk-gitea-admin.lock}"
+ADK_GITEA_LOCK_WAIT="${ADK_GITEA_LOCK_WAIT:-600}"
+[[ "$(id -u)" -ne 0 ]] || ADK_GITEA_LOCK=/run/adk-gitea-admin.lock
 
 gx() { docker compose -f "$ADK_GITEA_COMPOSE_FILE" exec -T -u git gitea "$@"; }
 gitea_cli() { gx gitea "$@"; }
@@ -44,8 +50,19 @@ json() { python3 -I -c 'import json, sys; d = json.loads(sys.argv[1]); print(eva
 # for the run and adk_gitea_admin_end sets it again FIRST (before anything that can fail).
 # A marker file next to the password file survives a crash or SIGKILL in between: the next
 # run sees it and sets the flag again. An existing password file (not handed over yet) also
-# means "must change". Leftover adk-init-* tokens of killed runs are deleted at start and end.
-_ADK_GITEA_ADMIN="" _ADK_SET_MUST_CHANGE=false _ADK_TMP_TOKEN_NAME=""
+# means "must change". Runs are serialized by a lock (ADK_GITEA_LOCK), so leftover adk-init-*
+# tokens of killed runs can be deleted at the start; at the end a run deletes its own token
+# (name unique per run).
+_ADK_GITEA_ADMIN="" _ADK_SET_MUST_CHANGE=false _ADK_TMP_TOKEN_NAME="" _ADK_GITEA_LOCK_FD=""
+
+# _adk_gitea_lock: take the admin lock for the rest of the process (waits ADK_GITEA_LOCK_WAIT s)
+_adk_gitea_lock() {
+  [[ -z "$_ADK_GITEA_LOCK_FD" ]] || return 0
+  [[ ! -L "$ADK_GITEA_LOCK" ]] || adk_die "$ADK_GITEA_LOCK is a symlink"
+  exec {_ADK_GITEA_LOCK_FD}>> "$ADK_GITEA_LOCK"
+  flock -w "$ADK_GITEA_LOCK_WAIT" "$_ADK_GITEA_LOCK_FD" \
+    || adk_die "another kit script is using the Gitea admin access ($ADK_GITEA_LOCK); try again later"
+}
 
 adk_gitea_must_change_marker() { printf '%s/.adk-gitea-must-change-pending' "$(dirname "$ADK_GITEA_PASSWORD_FILE")"; }
 
@@ -54,7 +71,9 @@ adk_gitea_admin_begin() {
   local admin="$1" scopes="$2" mc marker
   marker="$(adk_gitea_must_change_marker)"
   _ADK_GITEA_ADMIN="$admin"
-  _ADK_TMP_TOKEN_NAME="adk-init-$(date -u +%Y%m%d%H%M%S)-$$"
+  _adk_gitea_lock
+  _ADK_TMP_TOKEN_NAME="adk-init-$(date -u +%Y%m%d%H%M%S)-$$-$RANDOM"
+  # (under the lock: no other run is active, every adk-init-* token is a leftover)
   sql "DELETE FROM access_token WHERE name LIKE 'adk-init-%';" \
     || adk_die "cannot clean up old temporary tokens (is Gitea running?)"
   mc="$(sql "SELECT must_change_password FROM \"user\" WHERE lower_name = '${admin,,}';")"
@@ -83,7 +102,7 @@ adk_gitea_admin_end() {
     fi
   fi
   if [[ -n "$TOKEN" ]]; then
-    sql "DELETE FROM access_token WHERE name LIKE 'adk-init-%';" > /dev/null 2>&1 \
+    sql "DELETE FROM access_token WHERE name = '$_ADK_TMP_TOKEN_NAME';" > /dev/null 2>&1 \
       || echo "ERROR: could not delete the temporary token $_ADK_TMP_TOKEN_NAME (the next run does it)" >&2
     if ! api_try GET /user || [[ "$API_CODE" != 401 ]]; then
       echo "ERROR: temporary admin token $_ADK_TMP_TOKEN_NAME may still work (HTTP ${API_CODE:-none}); delete it in the Gitea UI" >&2
@@ -95,6 +114,19 @@ adk_gitea_admin_end() {
 }
 
 # --- repository protection ---------------------------------------------------------------
+# Teams of the organization that get access to a repository, only once it is protected
+# (protect-repo.sh): developers (agent-bot) and readers (prod-pull). They are not
+# "all repositories" teams, so a new repository is not writable for agent-bot before.
+# shellcheck disable=SC2034  # used by gitea-init.sh and protect-repo.sh
+ADK_REPO_TEAMS=(developers readers)
+
+# adk_repo_teams ORG/REPO: names of the teams with access to the repository (one per line)
+adk_repo_teams() {
+  api GET "/repos/$1/teams"
+  [[ "$API_CODE" == 200 ]] || adk_die "GET /repos/$1/teams: HTTP $API_CODE"
+  json '"\n".join(t["name"] for t in d)'
+}
+
 # adk_protection_problems ORG/REPO ADMIN: print one line per missing protection setting of
 # the repository's default branch and tags (empty = protected as protect-repo.sh sets it).
 # Needs TOKEN with read access to the repository.

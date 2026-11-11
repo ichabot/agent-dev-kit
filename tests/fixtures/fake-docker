@@ -35,6 +35,10 @@ if args == ["init"]:
     save({"users": {}, "tokens": [], "orgs": {}, "teams": {}, "repos": {}, "next_id": 1, "api_calls": 0})
     sys.exit(0)
 
+# docker rm -f NAME (one-off dump container)
+if args[:2] == ["rm", "-f"]:
+    log("rm -f " + " ".join(args[2:]))
+    sys.exit(0)
 # docker compose -f F [--project-directory D] exec|run [opts] gitea CMD...  /  stop|start|up ...
 if args[:1] != ["compose"]:
     print("fake docker: unsupported call: " + " ".join(args), file=sys.stderr)
@@ -53,7 +57,7 @@ if sub not in ("exec", "run"):
     sys.exit(99)
 i += 1
 while args[i].startswith("-"):
-    i += 2 if args[i] in ("-u", "--user", "-w", "-e") else 1
+    i += 2 if args[i] in ("-u", "--user", "-w", "-e", "--name") else 1
 service, cmd = args[i], args[i + 1:]
 assert service == "gitea", service
 if sub == "run":
@@ -119,6 +123,9 @@ if cmd[:3] == ["gitea", "admin", "user"]:
     sys.exit(0)
 
 if cmd[:2] == ["gitea", "dump"]:
+    if os.environ.get("FAKE_DUMP_SLEEP"):
+        import time
+        time.sleep(float(os.environ["FAKE_DUMP_SLEEP"]))
     if os.environ.get("FAKE_DUMP_FAIL"):
         print("fake dump failure", file=sys.stderr)
         sys.exit(1)
@@ -156,6 +163,11 @@ if cmd[0] == "sqlite3":
         for t in s["tokens"]:
             if t["user"].lower() == m.group(1) and t["name"].startswith("hermes-"):
                 print(t["scopes"])
+        sys.exit(0)
+    m = re.match(r"DELETE FROM access_token WHERE name = '([^']+)';", q)
+    if m:
+        s["tokens"] = [t for t in s["tokens"] if t["name"] != m.group(1)]
+        save(s)
         sys.exit(0)
     m = re.match(r"DELETE FROM access_token WHERE name LIKE 'adk-init-%';", q)
     if m:
@@ -258,6 +270,21 @@ if cmd[0] == "curl":
             t = dict(data, id=new_id())
             repo["tag_protections"].append(t)
             reply(201, t)
+        if sub == "/teams" and method == "GET":
+            reply(200, [{"name": n} for n in repo.get("teams", [])])
+        mteam = re.fullmatch(r"/teams/([^/]+)", sub)
+        if mteam:
+            name, org = mteam.group(1), m.group(1).split("/")[0]
+            if not any(t["org"] == org and t["name"] == name for t in s["teams"].values()):
+                reply(404, {"message": "team not found"})
+            teams = repo.setdefault("teams", [])
+            if method == "PUT":
+                if name not in teams:
+                    teams.append(name)
+                reply(204)
+            if method == "DELETE":
+                repo["teams"] = [t for t in teams if t != name]
+                reply(204)
         mt = re.fullmatch(r"/tag_protections/(\d+)", sub)
         if mt and method == "PATCH":
             t = next(t for t in repo["tag_protections"] if t["id"] == int(mt.group(1)))

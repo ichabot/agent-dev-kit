@@ -10,15 +10,19 @@
 #                     /root/adk-gitea-initial-password (0600), must be changed at first login
 #   agent-bot         bot account (no password, cannot log in to the web UI), member of team
 #                     "developers" of the organization: write code, issues, pull requests and
-#                     wiki, only READ releases, packages and actions; cannot create repositories
+#                     wiki, only READ releases, packages and actions - only in repositories
+#                     that protect-repo.sh protected and then added the team to; cannot create repositories
 #                     (in the organization Gitea would make it the repository's admin, which
 #                     could change branch protection; in its own namespace: max_repo_creation 0)
-#   prod-pull         bot account in team "readers" (read code, releases, packages); its
-#                     token is created per PROD server later; max_repo_creation 0
+#   prod-pull         bot account in team "readers" (read code, releases, packages; also only
+#                     in protected repositories); its token is created per PROD server later;
+#                     max_repo_creation 0
 #   CUSTOMER_NAME     private organization, owned by GITEA_ADMIN_USER
 #   hermes            ~/.config/gitea/token (agent-bot token, 0600) and a git credential
 #                     helper for https://GITEA_DOMAIN, written AS hermes (lib/user-file.sh)
-# Organization repositories without the protection of protect-repo.sh are listed as WARNING.
+# Organization repositories without the protection of protect-repo.sh are listed as WARNING,
+# and team developers loses access to them (agent-bot writes only in protected repositories);
+# protected repositories without the teams are listed as WARNING too.
 #
 # API calls run inside the Gitea container against 127.0.0.1:3000 with a temporary token of
 # the admin user, passed on stdin (never in argv) and deleted again at the end
@@ -43,7 +47,7 @@ BOT=agent-bot
 PULL=prod-pull
 # No write:package: PROD pulls images from the registry, agent-bot must not publish them.
 BOT_SCOPES="write:repository,write:issue,read:user,read:organization,read:package"
-ADMIN_SCOPES="write:organization,write:admin,read:repository,read:user"
+ADMIN_SCOPES="write:organization,write:admin,write:repository,read:user"
 
 usage() { echo "usage: $0 [--config FILE]" >&2; exit 2; }
 
@@ -146,7 +150,8 @@ READ_UNITS='{"repo.code":"read","repo.releases":"read","repo.packages":"read"}'
 declare -A TEAM_ID=()
 ensure_team() {
   local name="$1" permission="$2" units="$3" desc="$4" body id
-  body="{\"name\":\"$name\",\"description\":\"$desc\",\"permission\":\"$permission\",\"includes_all_repositories\":true,\"can_create_org_repo\":false,\"units_map\":$units}"
+  # not "all repositories": protect-repo.sh adds the team to a repository once it is protected
+  body="{\"name\":\"$name\",\"description\":\"$desc\",\"permission\":\"$permission\",\"includes_all_repositories\":false,\"can_create_org_repo\":false,\"units_map\":$units}"
   api GET "/orgs/$ORG/teams?limit=50"
   [[ "$API_CODE" == 200 ]] || adk_die "GET /orgs/$ORG/teams: HTTP $API_CODE"
   id="$(json "next((t['id'] for t in d if t['name'] == '$name'), '')")"
@@ -154,19 +159,19 @@ ensure_team() {
     api POST "/orgs/$ORG/teams" "$body"
     [[ "$API_CODE" == 201 ]] || adk_die "cannot create team $name (HTTP $API_CODE): $API_BODY"
     id="$(json 'd["id"]')"
-    adk_changed "team $name ($permission on all repositories, no repository creation)"
+    adk_changed "team $name ($permission on protected repositories only, no repository creation)"
   else
     local current
     current="$(json "next(t for t in d if t['name'] == '$name')")"
     if ! python3 -I -c '
 import ast, json, sys
 t = ast.literal_eval(sys.argv[1]); want = json.loads(sys.argv[2])
-ok = t.get("includes_all_repositories") is True and t.get("can_create_org_repo") is False \
+ok = t.get("includes_all_repositories") is False and t.get("can_create_org_repo") is False \
   and {k: v for k, v in (t.get("units_map") or {}).items() if v != "none"} == want
 sys.exit(0 if ok else 1)' "$current" "$units"; then
       api PATCH "/teams/$id" "$body"
       [[ "$API_CODE" == 200 ]] || adk_die "cannot update team $name (HTTP $API_CODE): $API_BODY"
-      adk_changed "team $name reset to $permission on all repositories"
+      adk_changed "team $name reset ($permission on protected repositories only)"
     else
       adk_ok "team $name"
     fi
@@ -187,8 +192,8 @@ ensure_member() {
   adk_changed "$user added to team $team"
 }
 
-ensure_team developers write "$DEV_UNITS" "agent-bot: write on all repositories, no admin"
-ensure_team readers read "$READ_UNITS" "prod-pull: read code, releases and packages"
+ensure_team developers write "$DEV_UNITS" "agent-bot: write on protected repositories, no admin"
+ensure_team readers read "$READ_UNITS" "prod-pull: read code, releases and packages of protected repositories"
 ensure_member developers "$BOT"
 ensure_member readers "$PULL"
 
@@ -230,16 +235,30 @@ unprotected=0
 for repo in "${repos[@]}"; do
   [[ -n "$repo" ]] || continue
   problems="$(adk_protection_problems "$repo" "$ADMIN")"
+  teams="$(adk_repo_teams "$repo")"
   if [[ -z "$problems" ]]; then
-    adk_ok "$repo protected (default branch, tags)"
+    no_access=""
+    for team in "${ADK_REPO_TEAMS[@]}"; do grep -qx "$team" <<< "$teams" || no_access+=" $team"; done
+    if [[ -z "$no_access" ]]; then
+      adk_ok "$repo protected (default branch, tags), teams ${ADK_REPO_TEAMS[*]}"
+    else
+      echo "WARNING: $repo is protected, but team(s)$no_access have no access yet (agent-bot cannot work there)"
+      echo "  fix: sudo /opt/adk/agent/protect-repo.sh $repo"
+    fi
   else
     unprotected=$((unprotected + 1))
     echo "WARNING: $repo is not protected as required:"
     while IFS= read -r line; do echo "  - $line"; done <<< "$problems"
     echo "  fix: sudo /opt/adk/agent/protect-repo.sh $repo"
+    # agent-bot must not write where merges and tags are not limited to the employee
+    if grep -qx developers <<< "$teams"; then
+      api DELETE "/repos/$repo/teams/developers"
+      [[ "$API_CODE" == 204 ]] || adk_die "cannot remove team developers from $repo (HTTP $API_CODE): $API_BODY"
+      adk_changed "$repo: team developers removed (agent-bot gets access again through protect-repo.sh)"
+    fi
   fi
 done
-((unprotected == 0)) || echo "WARNING: $unprotected repositor(y/ies) of $ORG without protection: agent-bot could merge or tag there"
+((unprotected == 0)) || echo "WARNING: $unprotected repositor(y/ies) of $ORG without protection: agent-bot has no access there until protect-repo.sh ran"
 
 # --- agent-bot token for hermes ----------------------------------------------------------
 echo "== agent-bot token for $AGENT_USER"
