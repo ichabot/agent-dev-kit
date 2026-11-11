@@ -14,8 +14,8 @@ The customer's staff reviews and approves; the agent never touches PROD.
 
 ## Status
 
-In progress: agent VPS base and services (PR 2a/2b). See [docs/plan.md](docs/plan.md)
-(German) and the issues for the PR sequence.
+Done: agent VPS (PR 2a/2b), TEST VM with CI deploys (PR 3). Next: project template and safe
+updates (PR 4). See [docs/plan.md](docs/plan.md) (German) and the issues for the PR sequence.
 
 ## Contents
 
@@ -26,22 +26,30 @@ In progress: agent VPS base and services (PR 2a/2b). See [docs/plan.md](docs/pla
 | `scripts/lib/config.sh` | Shared loader: every script reads `kit.env` through it, never `source`s it |
 | `scripts/lib/cidr.py` | Firewall source rules (public only, minimum prefix), shared by all scripts |
 | `scripts/lib/pubkey.sh` | SSH public key validation |
-| `agent/firewall-rules.sh` | Hetzner Cloud firewall rules of the agent VPS from `kit.env` |
+| `agent/firewall-rules.sh` | Hetzner Cloud firewall rules of the agent VPS (`--extra-https-source`: the TEST VM) or the TEST VM (`--role test`) from `kit.env` |
 | `agent/render-cloud-init.sh` | First-boot cloud-config (admin user, root-owned keys, sshd hardening) |
-| `agent/provision.sh` | Creates firewall, server and backups via the Hetzner Cloud API (`--dry-run`) |
-| `agent/bootstrap.sh` | Copies the kit to the VPS and runs `agent/setup.sh` there |
+| `agent/provision.sh` | Creates firewall, server and backups via the Hetzner Cloud API (`--dry-run`); `--role test` for the TEST VM |
+| `agent/bootstrap.sh` | Copies the kit to the VPS and runs `agent/setup.sh` there (`--role test`: `test/setup.sh` on the TEST VM) |
 | `agent/setup.sh` | On the VPS: packages, swap, Docker, users `hermes` and `ci` with rootless Docker, egress limits (nftables), Hermes Agent, then the services below |
 | `agent/render-services.sh` | Renders `compose.yaml` (Gitea + Caddy), `Caddyfile` (DNS-01/HTTP-01, admin API off) and the runner config from `kit.env` |
 | `agent/gitea-init.sh` | Gitea organization, teams and accounts (employee admin, `agent-bot`, `prod-pull`); agent-bot token for `hermes`; warns about unprotected repositories |
 | `agent/protect-repo.sh` | Protects a repository: default branch only via pull request, merge and approval only by the employee, tags only by the employee |
 | `agent/ci-reset.sh` | Root steps of the CI runner unit: wipe user `ci` after every job, fresh rootless Docker and ephemeral registration before the next |
-| `agent/set-secret.sh` | Stores a whitelisted secret (DNS API token) from stdin in `/opt/adk/secrets` |
+| `agent/set-secret.sh` | Stores a whitelisted secret (DNS API token, TEST VM's Gitea pull token) from stdin in `/opt/adk/secrets` |
+| `agent/test-deploy-key.sh` | Agent VPS: CI deploy key for the TEST VM (made on the VPS, private part only into the org Actions secret `TEST_DEPLOY_KEY`), pinned TEST host keys |
+| `agent/test-pull-token.sh` | Agent VPS: new read-only token of the Gitea bot `test-pull`, piped to the TEST VM |
 | `agent/backup.sh`, `agent/restore.sh` | Nightly backup (Gitea dump, secrets, home of `hermes`; signed MANIFEST; off-site copy encrypted with age; timer in `agent/systemd/`) and restore |
 | `agent/lib/versions.sh` | Pinned image digests, Caddy DNS modules and the runner's sha256 |
-| `agent/add-key.sh`, `agent/remove-key.sh` | Manage SSH keys in the root-owned key files (key from stdin; `--terminate` ends sessions) |
+| `agent/add-key.sh`, `agent/remove-key.sh` | Manage SSH keys in the root-owned key files (key from stdin; `--terminate` ends sessions; `--forced-command deploy` on the TEST VM) |
 | `agent/sshd-adk.conf` | sshd drop-in (key-only, no forwarding except Desktop's loopback tunnel) |
-| `agent/lib/` | Setup helpers; `user-file.sh` does every file operation in a user's home as that user |
+| `agent/lib/` | Setup helpers; `user-file.sh` does every file operation in a user's home as that user; `base.sh` (packages, Docker, sshd) and `caddy.sh` are shared with the TEST VM |
+| `test/provision.sh` | TEST VM in the Hetzner project (`agent/provision.sh --role test`); updates the agent firewall |
+| `test/setup.sh` | On the TEST VM: base, sshd (`test/sshd-adk-test.conf`), Docker, Caddy (`test/render-services.sh`), users `deploy`/`adk-app`, sudoers rule |
+| `test/deploy-gate.sh` | Forced command of `deploy`: accepts only `deploy <project> <ref>` |
+| `test/deploy.sh` | Root step: fetch `deploy/` from Gitea, run `deploy/update.sh` as `adk-app`, health, Caddy site with validate + reload |
+| `test/deploy-test.workflow.yaml` | CI template for projects: tests, then deploy the merged commit to TEST |
 | `docs/agent-vps.md` | Agent VPS: what runs where, ports, accounts, secrets, backup/restore, commands in order (German) |
+| `docs/test-vm.md` | TEST VM: firewall, deploy path, deployment contract for TEST, CI job, known limits (German) |
 | `docs/plan.md` | Rollout plan |
 | `docs/hermes-remote.md` | How Hermes Desktop connects to the VPS (SSH mode) |
 | `docs/hermes-tuning.md` | Skills and toolsets to disable on a dev server (token savings) |
@@ -52,6 +60,7 @@ In progress: agent VPS base and services (PR 2a/2b). See [docs/plan.md](docs/pla
 cp kit.env.example kit.env    # fill in
 scripts/check-config.sh       # validates kit.env
 agent/provision.sh --pubkey ~/.ssh/id_ed25519.pub --dry-run   # see docs/agent-vps.md
+test/provision.sh --pubkey ~/.ssh/id_ed25519.pub --dry-run    # see docs/test-vm.md
 make check                    # shellcheck + bats (development)
 ```
 

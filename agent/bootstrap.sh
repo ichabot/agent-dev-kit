@@ -35,7 +35,10 @@ while (($#)); do
   case "$1" in
     --role) (($# >= 2)) || usage; ROLE="$2"; shift 2 ;;
     --user) (($# >= 2)) || usage; USER_NAME="$2"; shift 2 ;;
-    --identity) (($# >= 2)) || usage; [[ -f "$2" ]] || usage; SSH_OPTS+=(-o IdentitiesOnly=yes -i "$2"); shift 2 ;;
+    --identity)
+      (($# >= 2)) || usage; [[ -f "$2" ]] || usage
+      # absolute: rsync runs ssh from the staging directory
+      SSH_OPTS+=(-o IdentitiesOnly=yes -i "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); shift 2 ;;
     --config) (($# >= 2)) || usage; CONFIG="$2"; shift 2 ;;
     -*) usage ;;
     *) [[ -z "$HOST" ]] || usage; HOST="$1"; shift ;;

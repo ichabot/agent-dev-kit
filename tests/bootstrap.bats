@@ -146,3 +146,12 @@ EOF
   run "$K/agent/bootstrap.sh" --role prod --config "$CFG" 203.0.113.60
   [ "$status" -eq 2 ]
 }
+
+@test "a relative --identity works for rsync too (made absolute)" {
+  ssh-keygen -q -t ed25519 -N '' -f "$BATS_TEST_TMPDIR/id"
+  cd "$BATS_TEST_TMPDIR"
+  run "$K/agent/bootstrap.sh" --identity id --config "$CFG" 203.0.113.50
+  [ "$status" -eq 0 ]
+  grep -q -- "-i $BATS_TEST_TMPDIR/id " "$RSYNC_LOG"
+  ! grep -q -- "-i id " "$RSYNC_LOG" || return 1
+}
