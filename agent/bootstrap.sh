@@ -37,6 +37,9 @@ done
 [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || usage
 [[ "$HOST" =~ ^[A-Za-z0-9.:-]+$ ]] || usage
 [[ -f "$CONFIG" ]] || { echo "ERROR: config file not found: $CONFIG" >&2; exit 2; }
+for tool in ssh rsync python3; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is required on this machine"
+done
 
 "$ROOT/scripts/check-config.sh" "$CONFIG" >/dev/null || {
   "$ROOT/scripts/check-config.sh" "$CONFIG" || true

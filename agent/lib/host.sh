@@ -58,10 +58,11 @@ adk_user_env() {
   shift
   uid="$(id -u "$user")"
   home="$(getent passwd "$user" | cut -d: -f6)"
-  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash \
+  # Subshell in the user's home: the caller's cwd may be unreadable for the user.
+  (cd "$home" && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash \
     PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-    "$@"
+    "$@")
 }
 
 # adk_put_block FILE OWNER[:GROUP] MARKER top|bottom < block
