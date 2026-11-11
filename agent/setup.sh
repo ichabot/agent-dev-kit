@@ -149,7 +149,8 @@ EOF
 then
   apt-get update -q
 fi
-adk_apt_install docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras
+adk_apt_install docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
+  docker-ce-rootless-extras
 # Written after the install (not a package conffile, but the daemon must exist first).
 if adk_put_file /etc/docker/daemon.json 0644 root:root <<'EOF'
 {

@@ -119,7 +119,7 @@ adk_services_up() {
     adk_changed "$ADK_DATA_DIR/gitea"
   fi
   if [[ -f "$ADK_SERVICES_DIR/caddy/Dockerfile" ]]; then
-    image="$(adk_compose config --images caddy)"
+    image="$(adk_compose config --format json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["services"]["caddy"]["image"])')"
     if docker image inspect "$image" >/dev/null 2>&1; then
       adk_ok "caddy image $image"
     else
