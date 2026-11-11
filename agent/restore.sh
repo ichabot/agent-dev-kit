@@ -133,7 +133,7 @@ if [[ "$DO_HOME" == true ]]; then
   echo "== home of $AGENT_USER"
   home="$(adk_user_home "$AGENT_USER")"
   [[ -n "$home" ]] || adk_die "user $AGENT_USER does not exist (run setup.sh first)"
-  adk_as_user "$AGENT_USER" tar -C "$home" -xf - < "$DIR/hermes-home.tar" \
+  adk_as_user "$AGENT_USER" tar -C "$home" --preserve-permissions -xf - < "$DIR/hermes-home.tar" \
     || adk_die "unpacking hermes-home.tar as $AGENT_USER failed"
   echo "restored: home of $AGENT_USER (unpacked as $AGENT_USER)"
 fi

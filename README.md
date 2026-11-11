@@ -14,8 +14,8 @@ The customer's staff reviews and approves; the agent never touches PROD.
 
 ## Status
 
-In progress: agent VPS base (PR 2a). See [docs/plan.md](docs/plan.md) (German) and the
-issues for the PR sequence.
+In progress: agent VPS base and services (PR 2a/2b). See [docs/plan.md](docs/plan.md)
+(German) and the issues for the PR sequence.
 
 ## Contents
 
@@ -30,11 +30,16 @@ issues for the PR sequence.
 | `agent/render-cloud-init.sh` | First-boot cloud-config (admin user, root-owned keys, sshd hardening) |
 | `agent/provision.sh` | Creates firewall, server and backups via the Hetzner Cloud API (`--dry-run`) |
 | `agent/bootstrap.sh` | Copies the kit to the VPS and runs `agent/setup.sh` there |
-| `agent/setup.sh` | On the VPS: packages, swap, Docker, user `hermes` with rootless Docker, egress limits (nftables), Hermes Agent |
+| `agent/setup.sh` | On the VPS: packages, swap, Docker, users `hermes` and `ci` with rootless Docker, egress limits (nftables), Hermes Agent, then the services below |
+| `agent/render-services.sh` | Renders `compose.yaml` (Gitea + Caddy), `Caddyfile` (DNS-01/HTTP-01, admin API off) and the runner config from `kit.env` |
+| `agent/gitea-init.sh` | Gitea organization, teams and accounts (employee admin, `agent-bot`, `prod-pull`); agent-bot token for `hermes` |
+| `agent/set-secret.sh` | Stores a whitelisted secret (DNS API token) from stdin in `/opt/adk/secrets` |
+| `agent/backup.sh`, `agent/restore.sh` | Nightly backup (Gitea dump, secrets, home of `hermes`; timer in `agent/systemd/`) and restore |
+| `agent/lib/versions.sh` | Pinned image digests, Caddy DNS modules and the runner's sha256 |
 | `agent/add-key.sh`, `agent/remove-key.sh` | Manage SSH keys in the root-owned key files (key from stdin; `--terminate` ends sessions) |
 | `agent/sshd-adk.conf` | sshd drop-in (key-only, no forwarding except Desktop's loopback tunnel) |
 | `agent/lib/` | Setup helpers; `user-file.sh` does every file operation in a user's home as that user |
-| `docs/agent-vps.md` | Agent VPS: what runs where, commands in order (German) |
+| `docs/agent-vps.md` | Agent VPS: what runs where, ports, accounts, secrets, backup/restore, commands in order (German) |
 | `docs/plan.md` | Rollout plan |
 | `docs/hermes-remote.md` | How Hermes Desktop connects to the VPS (SSH mode) |
 | `docs/hermes-tuning.md` | Skills and toolsets to disable on a dev server (token savings) |

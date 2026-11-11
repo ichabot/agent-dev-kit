@@ -86,12 +86,17 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 **Security-Gate:** Exponiert SSH, Gitea (443), VPN – alles nur für `CUSTOMER_IPS` (Hetzner Cloud Firewall) und zusätzlich nur an den nötigen Interfaces gebunden. Ausgehend offen (LLM-API, Pakete, ACME). Blast-Radius Agent: User `hermes` ohne root/Docker-Gruppe; Gitea-Bot `agent-bot` ohne Admin, `main` geschützt (Merge nur nach Freigabe durch Mitarbeiter-Account).
 
 **Dateien (2a):** `agent/provision.sh` (hcloud: Server, Firewall, Backups an), `agent/firewall-rules.sh`, `agent/cloud-init.yaml.tmpl` + `agent/render-cloud-init.sh`, `agent/sshd-adk.conf`, `agent/bootstrap.sh`, `agent/setup.sh` (inkl. Hermes-Installation), `agent/add-key.sh`, `agent/remove-key.sh`, `agent/lib/*`; Tests flach unter `tests/*.bats`.
-**Dateien (2b, geplant):** `agent/compose.yaml` (Gitea, act_runner, Caddy), `agent/Caddyfile.tmpl`, `agent/backup.sh`, `agent/systemd/*.timer`.
+**Dateien (2b):** `agent/render-services.sh` (erzeugt `/opt/adk/services/compose.yaml` mit Gitea + Caddy, `Caddyfile`, Caddy-Dockerfile für DNS-01 und `/etc/adk/runner.yaml`), `agent/lib/services.sh` (Setup-Schritte: Secrets, Compose, Runner als User `ci` mit systemd-Unit `adk-act-runner.service`, Backup-Timer), `agent/lib/versions.sh` (Versionen + Digests/sha256), `agent/gitea-init.sh`, `agent/set-secret.sh`, `agent/backup.sh`, `agent/restore.sh`, `agent/systemd/adk-backup.{service,timer}`; Tests `tests/{render-services,set-secret,gitea-init,backup,restore}.bats`. Der Runner läuft nicht in Compose, sondern als Systemdienst mit dem rootless Docker von `ci`.
 
 **Hinweise für 2b (aus dem Review von 2a):**
 - `PermitOpen 127.0.0.1:*` gibt `hermes` auch Loopback-Admin-Endpunkte frei, z. B. Caddys Admin-API auf `:2019`. In 2b abschalten (`admin off`) oder auf einen Unix-Socket legen; generell keine Admin-Endpunkte ohne Auth auf Loopback.
 - Der CI-User `ci` kommt in die nftables-Egress-Regeln (`adk_egress_rules` in `agent/lib/host.sh`, zweite uid), damit auch CI-Jobs den Metadaten-Dienst nicht erreichen.
 - Keine Secrets in user_data oder Metadaten (Metadaten-Sperre ist nur für die eingeschränkten uids).
+
+**Ergebnisse aus 2b:**
+- `agent-bot` darf keine Repos in der Organisation anlegen: Gitea macht den Ersteller eines Repos zu dessen Admin, damit könnte der Agent den Branch-Schutz abschalten. Repos legt der Mitarbeiter an (für PR 5: Skill „Projekt anlegen“ bittet den Mitarbeiter darum oder nutzt ein root-Hilfsskript).
+- `agent-bot` und `prod-pull` sind Gitea-Bot-Konten (kein Passwort, keine Web-Anmeldung).
+- Branch-Schutz pro Repo setzt der Mitarbeiter (Gitea kennt keinen Organisations-Standard); PR 4/5 liefern dafür eine Anleitung bzw. ein Skript.
 
 **Regeln:**
 - SSH nur Key, kein Passwort, kein root-Login nach Setup (eigener Admin-User mit sudo).
