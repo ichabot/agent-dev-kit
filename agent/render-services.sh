@@ -101,7 +101,14 @@ fi
   echo "	admin off"
   echo "	email $EMAIL"
   if [[ "$MODE" == dns01 && -z "$TLS_INTERNAL" ]]; then
-    echo "	acme_dns $PROVIDER {env.DNS_API_TOKEN}"
+    syntax="${ADK_CADDY_DNS_TOKEN_SYNTAX[$PROVIDER]:-arg}"
+    if [[ "$syntax" == arg ]]; then
+      echo "	acme_dns $PROVIDER {env.DNS_API_TOKEN}"
+    else
+      echo "	acme_dns $PROVIDER {"
+      echo "		$syntax {env.DNS_API_TOKEN}"
+      echo "	}"
+    fi
   fi
   echo "	servers {"
   echo "		# HTTP/3 needs udp/443, which the Hetzner firewall does not open."
@@ -140,6 +147,17 @@ services:
   gitea:
     image: $ADK_GITEA_IMAGE
     restart: unless-stopped
+    # The s6 entrypoint runs as root: it adjusts uid/gid of git, chowns /data, switches to git
+    # (su-exec) and signals its services. Nothing else is needed.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+      - KILL
     security_opt:
       - no-new-privileges:true
     environment:

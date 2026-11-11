@@ -13,13 +13,21 @@ ADK_CADDY_VERSION="2.11.9"
 ADK_CADDY_IMAGE="docker.io/library/caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee"
 ADK_CADDY_BUILDER_IMAGE="docker.io/library/caddy:2.11.9-builder-alpine@sha256:646fee578e680989ca5c7fd1ce6f1de574d19fd71ef2221810cc0510a9f40c86"
 
-# caddy-dns modules with a pinned version. Only providers whose Caddyfile syntax takes a
-# single API token ("acme_dns <name> <token>") are listed; others need a kit change.
+# caddy-dns modules with a pinned version, and how each takes its single API token in the
+# Caddyfile (checked against the module source at that version): "arg" = acme_dns <name>
+# <token>, otherwise the name of the subdirective in a block (desec: token). Providers that
+# need more than one token are not supported; they need a kit change.
 declare -A ADK_CADDY_DNS_MODULES=(
   [hetzner]="github.com/caddy-dns/hetzner/v2@v2.0.1"
   [cloudflare]="github.com/caddy-dns/cloudflare@v0.2.4"
   [ionos]="github.com/caddy-dns/ionos@v1.3.0"
   [desec]="github.com/caddy-dns/desec@v1.1.0"
+)
+declare -A ADK_CADDY_DNS_TOKEN_SYNTAX=(
+  [hetzner]=arg
+  [cloudflare]=arg
+  [ionos]=arg
+  [desec]=token
 )
 
 # Gitea runner (formerly act_runner), static binary from dl.gitea.com.

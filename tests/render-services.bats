@@ -166,6 +166,27 @@ y() {
   [ "$status" -eq 2 ]
 }
 
+@test "Caddyfile: token syntax per provider (desec only takes a block with token)" {
+  for p in hetzner cloudflare ionos; do
+    set_var DNS_PROVIDER "$p"
+    "$RENDER" --config "$CFG" --out "$OUT"
+    grep -qx "	acme_dns $p {env.DNS_API_TOKEN}" "$OUT/Caddyfile"
+  done
+  set_var DNS_PROVIDER desec
+  "$RENDER" --config "$CFG" --out "$OUT"
+  grep -qx '	acme_dns desec {' "$OUT/Caddyfile"
+  grep -qx '		token {env.DNS_API_TOKEN}' "$OUT/Caddyfile"
+  refute grep -q 'acme_dns desec {env' "$OUT/Caddyfile"
+  grep -q 'github.com/caddy-dns/desec@' "$OUT/caddy/Dockerfile"
+}
+
+@test "compose: Gitea drops all capabilities except those its s6 entrypoint needs" {
+  need_yaml
+  "$RENDER" --config "$CFG" --out "$OUT"
+  [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["cap_drop"]')" = "['ALL']" ]
+  [ "$(y "$OUT/compose.yaml" 'sorted(c["services"]["gitea"]["cap_add"])')" = "['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL', 'SETGID', 'SETUID']" ]
+}
+
 @test "unknown DNS provider without a pinned module is refused" {
   set_var DNS_PROVIDER route53
   run "$RENDER" --config "$CFG" --out "$OUT"
@@ -197,7 +218,7 @@ y() {
   ADK_RUNNER_ADD_HOST=203.0.113.5 ADK_TLS_INTERNAL=1 "$RENDER" --config "$CFG" --out "$OUT"
   [ "$(y "$OUT/runner.yaml" 'c["container"]["options"]')" = "--add-host=git.example.com:203.0.113.5" ]
   [ "$(y "$OUT/runner.yaml" 'c["container"]["volumes"]')" = "['/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro']" ]
-  ADK_RUNNER_ADD_HOST='1.2.3.4 --privileged' run "$RENDER" --config "$CFG" --out "$OUT"
+  ADK_RUNNER_ADD_HOST='203.0.113.9 --privileged' run "$RENDER" --config "$CFG" --out "$OUT"
   [ "$status" -eq 2 ]
 }
 

@@ -14,7 +14,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib/config.sh"
 
 # Keys that may stay empty (further rules below can still require them).
-OPTIONAL=(DNS_PROVIDER BACKUP_TARGET)
+OPTIONAL=(DNS_PROVIDER BACKUP_TARGET BACKUP_AGE_RECIPIENT)
 # Firewall source rules (public only, minimum prefix) live in lib/cidr.py.
 
 usage() { echo "usage: $0 [FILE] | --list-keys" >&2; exit 2; }
@@ -46,7 +46,9 @@ fi
 
 load_config "$FILE"
 ERRORS=("${CFG_ERRORS[@]}")
+WARNINGS=()
 err() { ERRORS+=("$1: $2"); }
+warn() { WARNINGS+=("$1"); }
 
 is_optional() {
   local k
@@ -84,11 +86,13 @@ fi
 # Gitea user and organization names share one namespace; these are taken by Gitea itself or
 # by the kit's own accounts (agent/gitea-init.sh).
 GITEA_RESERVED=(admin root agent-bot prod-pull ghost gitea-actions api assets explore org repo user
-  users v2 login new notifications issues pulls milestones raw search avatars attachments)
+  users v2 login new notifications issues pulls milestones raw search avatars attachments
+  avatar captcha commits debug error metrics repo-avatars ssh_info help install)
 is_reserved() {
   local r
   for r in "${GITEA_RESERVED[@]}"; do [[ "$r" == "$1" ]] && return 0; done
-  return 1
+  # Gitea also reserves these suffixes (routes for keys, feeds, avatars)
+  [[ "$1" =~ \.(keys|gpg|rss|atom|png)$ ]]
 }
 if [[ -n "$v" ]] && is_reserved "$v"; then
   err CUSTOMER_NAME "'$v' is reserved in Gitea or by the kit (it becomes the Gitea organization)"
@@ -158,6 +162,9 @@ v="$(val DNS_PROVIDER)"
 if [[ -n "$v" && ! "$v" =~ ^[a-z0-9_]+$ ]]; then
   err DNS_PROVIDER "caddy-dns module name, a-z 0-9 _"
 fi
+if [[ "$v" == hetzner && "$(val ACME_MODE)" == dns01 ]]; then
+  warn "DNS_PROVIDER=hetzner: the token is a Hetzner Cloud API token with read/write on its whole project. Keep the DNS zone in a separate Hetzner project that contains nothing else (or delegate _acme-challenge via CNAME to a dedicated zone); never use the token of the agent VPS project (docs/agent-vps.md)."
+fi
 
 for k in HCLOUD_LOCATION AGENT_TYPE TEST_TYPE; do
   v="$(val "$k")"
@@ -170,8 +177,18 @@ v="$(val BACKUP_TARGET)"
 if [[ -n "$v" && ! "$v" =~ ^sftp://[A-Za-z0-9._-]+@[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._/-]*)?$ ]]; then
   err BACKUP_TARGET "sftp://user@host[:port]/path, no password (key auth only)"
 fi
+v="$(val BACKUP_AGE_RECIPIENT)"
+if [[ -n "$v" && ! "$v" =~ ^age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$ ]]; then
+  err BACKUP_AGE_RECIPIENT "must be an age public key (age1 followed by 58 lowercase bech32 characters; created with age-keygen)"
+fi
+if [[ -n "$(val BACKUP_TARGET)" && -z "$v" ]]; then
+  err BACKUP_AGE_RECIPIENT "required with BACKUP_TARGET: off-site copies are encrypted to this age public key"
+fi
 
 # --- result --------------------------------------------------------------
+if ((${#WARNINGS[@]})); then
+  printf 'WARNING: %s\n' "${WARNINGS[@]}"
+fi
 if ((${#ERRORS[@]})); then
   printf 'ERROR: %s\n' "${ERRORS[@]}"
   echo "${#ERRORS[@]} problem(s) in $FILE"

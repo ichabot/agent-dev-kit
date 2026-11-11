@@ -51,13 +51,19 @@ adk_gitea_secrets() {
   done
 }
 
-# adk_caddy_env MODE: env file with the DNS API token for Caddy (dns01 only)
+# adk_caddy_env MODE: env file with the DNS API token for Caddy (dns01 only). The value is
+# single-quoted (compose interpolates $ in unquoted and double-quoted values); a token with a
+# single quote is refused. Sets ADK_CADDY_ENV_CHANGED (true: Caddy must be recreated, a
+# restart keeps the old environment).
+ADK_CADDY_ENV_CHANGED=false
 adk_caddy_env() {
   local mode="$1" token_file="$ADK_SECRETS_DIR/dns-api-token" token
+  ADK_CADDY_ENV_CHANGED=false
   if [[ "$mode" != dns01 ]]; then
     if [[ -e "$ADK_SECRETS_DIR/caddy.env" ]]; then
       rm -f "$ADK_SECRETS_DIR/caddy.env"
       adk_changed "$ADK_SECRETS_DIR/caddy.env removed (ACME_MODE=$mode)"
+      ADK_CADDY_ENV_CHANGED=true
     fi
     return 0
   fi
@@ -68,7 +74,13 @@ adk_caddy_env() {
     exit 1
   fi
   token="$(cat "$token_file")"
-  adk_put_file "$ADK_SECRETS_DIR/caddy.env" 0600 root:root <<< "DNS_API_TOKEN=$token" || true
+  if [[ "$token" == *"'"* ]]; then
+    token=""
+    adk_die "$token_file contains a single quote; store the token again with set-secret.sh"
+  fi
+  if adk_put_file "$ADK_SECRETS_DIR/caddy.env" 0600 root:root <<< "DNS_API_TOKEN='$token'"; then
+    ADK_CADDY_ENV_CHANGED=true
+  fi
   token=""
 }
 
@@ -105,6 +117,17 @@ adk_render_services() {
   return 0
 }
 
+# adk_services_action RUNNING COMPOSE_CHANGED CADDYFILE_CHANGED CADDY_ENV_CHANGED: what to do
+# with the running services: up | recreate-caddy | restart-caddy | none
+adk_services_action() {
+  local running="$1" compose="$2" caddyfile="$3" env="$4"
+  if [[ "$compose" == true || "$running" != "caddy gitea " ]]; then echo up
+  elif [[ "$env" == true ]]; then echo recreate-caddy
+  elif [[ "$caddyfile" == true ]]; then echo restart-caddy
+  else echo none
+  fi
+}
+
 # adk_services_up: data directory, Caddy image (dns01), compose up when something changed
 # or a service is not running, wait until Gitea is healthy.
 adk_services_up() {
@@ -128,16 +151,23 @@ adk_services_up() {
     fi
   fi
   running="$(adk_compose ps --status running --services 2>/dev/null | sort | tr '\n' ' ')"
-  if [[ "$ADK_COMPOSE_CHANGED" == true || "$running" != "caddy gitea " ]]; then
-    adk_compose up -d --remove-orphans
-    adk_changed "services up (gitea, caddy)"
-  elif [[ "$ADK_CADDYFILE_CHANGED" == true ]]; then
-    # admin off: no live reload, a restart applies the new Caddyfile
-    adk_compose restart caddy
-    adk_changed "caddy restarted (Caddyfile changed)"
-  else
-    adk_ok "services running (gitea, caddy)"
-  fi
+  case "$(adk_services_action "$running" "$ADK_COMPOSE_CHANGED" "$ADK_CADDYFILE_CHANGED" "$ADK_CADDY_ENV_CHANGED")" in
+    up)
+      adk_compose up -d --remove-orphans
+      adk_changed "services up (gitea, caddy)"
+      ;;
+    recreate-caddy)
+      # env_file is read when the container is created: a restart would keep the old token
+      adk_compose up -d --force-recreate caddy
+      adk_changed "caddy recreated (DNS API token changed)"
+      ;;
+    restart-caddy)
+      # admin off: no live reload, a restart applies the new Caddyfile
+      adk_compose restart caddy
+      adk_changed "caddy restarted (Caddyfile changed)"
+      ;;
+    *) adk_ok "services running (gitea, caddy)" ;;
+  esac
   for ((i = 0; i < 90; i++)); do
     if adk_compose exec -T gitea curl -fsS -o /dev/null http://127.0.0.1:3000/api/healthz 2>/dev/null; then
       adk_ok "gitea healthy"

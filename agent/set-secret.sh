@@ -8,8 +8,8 @@
 #   dns-api-token   API token of the DNS provider for ACME DNS-01 (Caddy, ACME_MODE=dns01)
 #
 # The value is read from stdin only (never from argv, which every user can see in ps),
-# must be one line without whitespace, and is never printed. Run setup.sh afterwards so the
-# services pick it up. ADK_SECRETS_DIR overrides the directory for tests (non-root only).
+# must be one line without whitespace or single quotes, and is never printed. Run setup.sh
+# afterwards: it recreates Caddy so the new token is used. ADK_SECRETS_DIR overrides the directory for tests (non-root only).
 # Exit codes: 0 = stored / unchanged, 1 = invalid value, 2 = usage / permissions.
 set -euo pipefail
 export LC_ALL=C
@@ -51,6 +51,7 @@ value="${value%$'\r'}"
 [[ -n "$value" ]] || die "empty value"
 ((${#value} <= MAX_LEN)) || die "value longer than $MAX_LEN characters"
 [[ "$value" =~ ^[[:graph:]]+$ ]] || die "the value must not contain whitespace or control characters"
+[[ "$value" != *"'"* ]] || die "the value must not contain a single quote (it is written single-quoted for Caddy)"
 
 # --- store it -------------------------------------------------------------------------
 [[ ! -L "$dir" ]] || die "$dir is a symlink; not following it" 2
@@ -75,4 +76,4 @@ printf '%s' "$value" > "$tmp"
 chmod 0600 "$tmp"
 mv -f "$tmp" "$target"
 trap - EXIT
-echo "changed: secret $name stored in $target (mode 0600); run setup.sh to apply it"
+echo "changed: secret $name stored in $target (mode 0600); run setup.sh to apply it (recreates caddy)"

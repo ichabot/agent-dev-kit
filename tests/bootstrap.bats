@@ -119,7 +119,7 @@ EOF
   [ "$status" -eq 0 ]
   grep -qE ' sudo ADK_TLS_INTERNAL=1 ADK_RUNNER_ADD_HOST=203.0.113.50 /opt/adk/agent/setup.sh$' "$SSH_LOG"
   : > "$SSH_LOG"
-  ADK_RUNNER_ADD_HOST='1.2.3.4;id' run "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50
+  ADK_RUNNER_ADD_HOST='203.0.113.9;id' run "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50
   [ "$status" -eq 2 ]
   [ ! -s "$SSH_LOG" ]
   ADK_TLS_INTERNAL=yes run "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50

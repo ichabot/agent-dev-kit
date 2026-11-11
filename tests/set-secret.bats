@@ -69,6 +69,14 @@ refute() {
   [ ! -e "$ADK_SECRETS_DIR/dns-api-token" ]
 }
 
+@test "a value with a single quote is refused (Caddy's env file quotes with it)" {
+  run "$SET" dns-api-token <<< "ab'$VALUE"
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"$VALUE"* ]]
+  [[ "$output" == *"single quote"* ]]
+  [ ! -e "$ADK_SECRETS_DIR/dns-api-token" ]
+}
+
 @test "a symlinked secret file or directory is refused" {
   mkdir -m 0700 "$ADK_SECRETS_DIR"
   printf 'keep\n' > "$BATS_TEST_TMPDIR/victim"
