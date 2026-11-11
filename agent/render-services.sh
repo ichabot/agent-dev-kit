@@ -166,7 +166,7 @@ services:
       GITEA__openid__ENABLE_OPENID_SIGNUP: "false"
       GITEA__repository__DEFAULT_PRIVATE: "private"
       GITEA__session__COOKIE_SECURE: "true"
-      GITEA__cors__X_FRAME_OPTIONS: "DENY"
+      GITEA__security__X_FRAME_OPTIONS: "DENY"
       GITEA__actions__ENABLED: "true"
       GITEA__packages__ENABLED: "true"
       GITEA__mailer__ENABLED: "false"

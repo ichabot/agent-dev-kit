@@ -8,8 +8,8 @@
 #                       the container user git
 #   adk-secrets.tar     /opt/adk/secrets and /opt/adk/kit.env
 #   hermes-home.tar     home of hermes, packed AS hermes (tar never follows symlinks; root never
-#                       reads in that home); without ~/.cache, node_modules and the rootless
-#                       Docker data (~/.local/share/docker)
+#                       reads in that home); without caches (.cache, node_modules), the rootless
+#                       Docker data and the Hermes software that setup.sh installs again
 #   MANIFEST            sha256 of the files above
 # Keeps 7 days (the newest complete backup is never deleted). With BACKUP_TARGET the new
 # directory is copied with rsync over SSH (key /root/.ssh/adk-backup, set up by setup.sh).
@@ -73,9 +73,10 @@ log() { echo "backup: $*"; }
 
 # --- Gitea -------------------------------------------------------------------------------
 log "gitea dump"
+# (listing first, then grep: "grep -q" in a pipe would make tar die of SIGPIPE under pipefail)
 if docker compose -f "$COMPOSE_FILE" exec -T -u git -w /tmp gitea \
     gitea dump --type tar.gz --file - --quiet < /dev/null > "$DIR/gitea-dump.tar.gz" \
-  && tar -tzf "$DIR/gitea-dump.tar.gz" 2>/dev/null | grep -qx 'gitea-db.sql'; then
+  && listing="$(tar -tzf "$DIR/gitea-dump.tar.gz")" && grep -qx 'gitea-db.sql' <<< "$listing"; then
   log "gitea-dump.tar.gz $(du -h "$DIR/gitea-dump.tar.gz" | cut -f1)"
 else
   fail "gitea-dump: gitea dump failed or the archive has no gitea-db.sql"
@@ -92,8 +93,12 @@ fi
 # --- home of hermes (packed as hermes) -------------------------------------------------------
 log "home of $AGENT_USER"
 rc=0
+# Excluded: caches, rootless Docker data, and software setup.sh installs again (Hermes code,
+# its tools and Python runtimes); kept: ~/.hermes config, memories, sessions, skills, projects.
 adk_as_user "$AGENT_USER" tar -C "$AGENT_HOME" --one-file-system \
-  --exclude=./.cache --exclude=./.local/share/docker --exclude=node_modules \
+  --exclude=.cache --exclude=node_modules --exclude=./.local/share/docker \
+  --exclude=./.local/share/uv --exclude=./.hermes/hermes-agent --exclude=./.hermes/tools \
+  --exclude=./.hermes/cache --exclude=./.hermes/installs \
   -cf - . > "$DIR/hermes-home.tar" || rc=$?
 case "$rc" in
   0) log "hermes-home.tar $(du -h "$DIR/hermes-home.tar" | cut -f1)" ;;
