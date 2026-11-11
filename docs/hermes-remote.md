@@ -23,11 +23,14 @@ Hermes instance on the agent VPS.
 
 1. Non-interactive key login works with `BatchMode=yes` (Desktop uses BatchMode, so a key
    with passphrase must be loaded into the SSH agent).
-2. `hermes serve --isolated --port 0` prints `HERMES_DASHBOARD_READY port=<n>` and listens on
+2. `hermes serve --isolated --port 0` prints a READY line with the port and listens on
    `127.0.0.1:<n>` only.
 3. Through `ssh -N -L` the API answers (`/api/status` → version 0.23.1).
 4. The same port is **not** reachable directly from the LAN.
 5. Protected endpoints return **401** without the session token that Desktop adopts over the tunnel.
+6. With the sshd hardening below, the tunnel to `127.0.0.1` still works, a forward to any other
+   host is refused (`administratively prohibited`), and keys the Hermes user writes into its
+   own `~/.ssh/authorized_keys` are ignored.
 
 ## Requirements for the VPS (input for PR 2)
 
@@ -36,10 +39,29 @@ Hermes instance on the agent VPS.
 - `python3` present (Desktop's remote probes use it).
 - `hermes` resolvable in a login shell (`~/.local/bin` via `~/.profile`); otherwise set
   **Hermes path** in the Desktop connection to `/home/<user>/.local/bin/hermes`.
-- sshd: `PasswordAuthentication no`, `PermitRootLogin no`, `AllowTcpForwarding local`
-  (Desktop needs local forwarding only), `AllowUsers <hermes-user> <admin-user>`.
-- Employee's public key in `~/.ssh/authorized_keys` of the Hermes user.
+- Employee's public key in a **root-owned** key file, so the agent cannot add its own keys
+  and keep access after handover.
 - No systemd unit for `hermes serve` needed; Desktop starts and stops it.
+- sshd drop-in (`/etc/ssh/sshd_config.d/10-adk.conf`), verified with `sshd -T -C user=<hermes-user>`:
+
+```
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+AllowTcpForwarding no
+X11Forwarding no
+AllowUsers <hermes-user> <admin-user>
+
+# Desktop needs local forwarding to the loopback backend only; this blocks tunnels into
+# Docker networks or the cloud metadata service.
+Match User <hermes-user>
+    AllowTcpForwarding local
+    PermitOpen 127.0.0.1:*
+```
+
+`/etc/ssh/authorized_keys/` is `root:root 0755`, each file `root:root 0644`.
+Debian 13: apply with `systemctl restart ssh` (`reload` failed in the test container).
 
 ## Desktop side (customer workstation)
 

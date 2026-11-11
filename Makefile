@@ -3,7 +3,8 @@
 check: lint test
 
 lint:
-	shellcheck scripts/*.sh
+	shellcheck -x scripts/*.sh scripts/lib/*.sh
+	shellcheck tests/*.bats
 
 test:
 	bats tests/
