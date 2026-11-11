@@ -85,7 +85,13 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 
 **Security-Gate:** Exponiert SSH, Gitea (443), VPN – alles nur für `CUSTOMER_IPS` (Hetzner Cloud Firewall) und zusätzlich nur an den nötigen Interfaces gebunden. Ausgehend offen (LLM-API, Pakete, ACME). Blast-Radius Agent: User `hermes` ohne root/Docker-Gruppe; Gitea-Bot `agent-bot` ohne Admin, `main` geschützt (Merge nur nach Freigabe durch Mitarbeiter-Account).
 
-**Dateien:** `agent/provision.sh` (hcloud: Server, Firewall, Backups an), `agent/cloud-init.yaml`, `agent/compose.yaml` (Gitea, act_runner, Caddy), `agent/Caddyfile.tmpl`, `agent/install-hermes.sh`, `agent/backup.sh`, `agent/systemd/*.timer`, Tests unter `tests/agent/`.
+**Dateien (2a):** `agent/provision.sh` (hcloud: Server, Firewall, Backups an), `agent/firewall-rules.sh`, `agent/cloud-init.yaml.tmpl` + `agent/render-cloud-init.sh`, `agent/sshd-adk.conf`, `agent/bootstrap.sh`, `agent/setup.sh` (inkl. Hermes-Installation), `agent/add-key.sh`, `agent/remove-key.sh`, `agent/lib/*`; Tests flach unter `tests/*.bats`.
+**Dateien (2b, geplant):** `agent/compose.yaml` (Gitea, act_runner, Caddy), `agent/Caddyfile.tmpl`, `agent/backup.sh`, `agent/systemd/*.timer`.
+
+**Hinweise für 2b (aus dem Review von 2a):**
+- `PermitOpen 127.0.0.1:*` gibt `hermes` auch Loopback-Admin-Endpunkte frei, z. B. Caddys Admin-API auf `:2019`. In 2b abschalten (`admin off`) oder auf einen Unix-Socket legen; generell keine Admin-Endpunkte ohne Auth auf Loopback.
+- Der CI-User `ci` kommt in die nftables-Egress-Regeln (`adk_egress_rules` in `agent/lib/host.sh`, zweite uid), damit auch CI-Jobs den Metadaten-Dienst nicht erreichen.
+- Keine Secrets in user_data oder Metadaten (Metadaten-Sperre ist nur für die eingeschränkten uids).
 
 **Regeln:**
 - SSH nur Key, kein Passwort, kein root-Login nach Setup (eigener Admin-User mit sudo).

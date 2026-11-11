@@ -30,8 +30,10 @@ issues for the PR sequence.
 | `agent/render-cloud-init.sh` | First-boot cloud-config (admin user, root-owned keys, sshd hardening) |
 | `agent/provision.sh` | Creates firewall, server and backups via the Hetzner Cloud API (`--dry-run`) |
 | `agent/bootstrap.sh` | Copies the kit to the VPS and runs `agent/setup.sh` there |
-| `agent/setup.sh` | On the VPS: packages, swap, Docker, user `hermes` with rootless Docker, Hermes Agent |
-| `agent/add-key.sh`, `agent/remove-key.sh` | Manage SSH keys in the root-owned key files |
+| `agent/setup.sh` | On the VPS: packages, swap, Docker, user `hermes` with rootless Docker, egress limits (nftables), Hermes Agent |
+| `agent/add-key.sh`, `agent/remove-key.sh` | Manage SSH keys in the root-owned key files (key from stdin; `--terminate` ends sessions) |
+| `agent/sshd-adk.conf` | sshd drop-in (key-only, no forwarding except Desktop's loopback tunnel) |
+| `agent/lib/` | Setup helpers; `user-file.sh` does every file operation in a user's home as that user |
 | `docs/agent-vps.md` | Agent VPS: what runs where, commands in order (German) |
 | `docs/plan.md` | Rollout plan |
 | `docs/hermes-remote.md` | How Hermes Desktop connects to the VPS (SSH mode) |
