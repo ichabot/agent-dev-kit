@@ -21,8 +21,18 @@ Planning. See [docs/plan.md](docs/plan.md) (German) and the issues for the PR se
 | Path | Purpose |
 |---|---|
 | `kit.env.example` | All placeholders (IPs, domains, VPN, DNS provider) |
+| `scripts/check-config.sh` | Validates `kit.env` (parsed, never sourced) |
 | `docs/plan.md` | Rollout plan |
+| `docs/hermes-remote.md` | How Hermes Desktop connects to the VPS (SSH mode) |
 | `docs/hermes-tuning.md` | Skills and toolsets to disable on a dev server (token savings) |
+
+## Usage
+
+```bash
+cp kit.env.example kit.env    # fill in
+scripts/check-config.sh       # validates kit.env
+make check                    # shellcheck + bats (development)
+```
 
 ## Requirements
 

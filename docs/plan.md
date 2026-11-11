@@ -62,7 +62,6 @@ der vorhandene Daten nie ohne Freigabe ändert. Nach der Übergabe gehört alles
 CUSTOMER_NAME=            # short id, e.g. acme
 CUSTOMER_IPS=             # static IPv4/IPv6 CIDRs, comma separated
 VPN_PORT= VPN_PROTO=udp   # VPN set up separately
-HERMES_BIND=              # VPN interface IP of the agent VPS (fallback 127.0.0.1 + SSH tunnel)
 GITEA_DOMAIN= TEST_DOMAIN=
 ACME_EMAIL= ACME_MODE=dns01   # dns01 | http01
 DNS_PROVIDER=             # caddy-dns module name, e.g. hetzner
@@ -79,7 +78,7 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 
 ## PR 2 – Agent-VPS
 
-**Security-Gate:** Exponiert SSH, Gitea (443), Hermes-Endpoint, VPN – alles nur für `CUSTOMER_IPS` (Hetzner Cloud Firewall) und zusätzlich nur an den nötigen Interfaces gebunden. Ausgehend offen (LLM-API, Pakete, ACME). Blast-Radius Agent: User `hermes` ohne root/Docker-Gruppe; Gitea-Bot `agent-bot` ohne Admin, `main` geschützt (Merge nur nach Freigabe durch Mitarbeiter-Account).
+**Security-Gate:** Exponiert SSH, Gitea (443), VPN – alles nur für `CUSTOMER_IPS` (Hetzner Cloud Firewall) und zusätzlich nur an den nötigen Interfaces gebunden. Ausgehend offen (LLM-API, Pakete, ACME). Blast-Radius Agent: User `hermes` ohne root/Docker-Gruppe; Gitea-Bot `agent-bot` ohne Admin, `main` geschützt (Merge nur nach Freigabe durch Mitarbeiter-Account).
 
 **Dateien:** `agent/provision.sh` (hcloud: Server, Firewall, Backups an), `agent/cloud-init.yaml`, `agent/compose.yaml` (Gitea, act_runner, Caddy), `agent/Caddyfile.tmpl`, `agent/install-hermes.sh`, `agent/backup.sh`, `agent/systemd/*.timer`, Tests unter `tests/agent/`.
 
@@ -95,7 +94,7 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 2. Cloud-Init: Basis-Härtung, Users, rootless Docker für `hermes`.
 3. Compose: Gitea + Runner + Caddy (DNS-01/HTTP-01 je `ACME_MODE`).
 4. Gitea-Init-Skript: Accounts, Tokens, Branch-Schutz, Template-Repo-Platz.
-5. Hermes-Installation als `hermes`, Endpoint gemäß Spike an `HERMES_BIND`.
+5. Hermes-Installation als `hermes` (vorher `libatomic1` installieren). Kein offener Hermes-Port: Desktop verbindet per SSH (siehe `docs/hermes-remote.md`); sshd mit Key-only und `AllowTcpForwarding local`.
 6. Backup + Restore-Skript, Restore-Test.
 
 **Abnahme:** Port-Scan von fremder IP: alles zu. Von Kunden-IP: 443/22/VPN offen. Gitea per HTTPS erreichbar, `agent-bot` kann nicht auf `main` pushen. Restore aus Backup funktioniert.
@@ -172,7 +171,7 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 - `docs/hermes-tuning.md` nach größeren Hermes-Updates neu prüfen.
 
 ## Risiken
-- Remote-Anbindung der Hermes-Desktop-App nicht verifiziert → Spike in PR 1 vor allem anderen.
+- Remote-Anbindung der Desktop-App: per Spike geklärt (SSH-Modus), Test mit echter Desktop-App unter Windows steht noch aus.
 - DNS-Anbieter des Kunden ohne Caddy-DNS-Modul → Fallback HTTP-01 (Port 80 öffentlich).
 - Frameworks mit eigenem Migrator (Prisma, Django, EF) passen nicht direkt zu `dbmate` → Vertrag verlangt dann exportierte SQL-Migrationen mit Kopf; prüfen, sobald der Stack feststeht.
 - Hermes-/Gitea-Updates nach der Übergabe liegen beim Mitarbeiter → Doku + Hinweis-Skill, kein Auto-Update.
