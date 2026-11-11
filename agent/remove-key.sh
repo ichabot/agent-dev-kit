@@ -5,8 +5,9 @@
 #
 #   --force      allow removing the last adk-admin key (locks every administrator out)
 #   --terminate  also end all sessions and tunnels of the user (loginctl terminate-user);
-#                for hermes the lingering user services (rootless Docker) are started again.
-#                For adk-admin this ends your own session too.
+#                for hermes the lingering user manager (rootless Docker) keeps running or
+#                is started again - audit it (printed below). For adk-admin this ends your
+#                own session too.
 #
 # The fingerprint is the second field of `ssh-keygen -l -f key.pub`. A removed key cannot
 # log in again, but open sessions stay up without --terminate. Runs under a lock on the
@@ -73,7 +74,7 @@ if [[ "$terminate" == true ]]; then
   if [[ "$user" == hermes && "$(loginctl show-user "$user" -p Linger --value 2>/dev/null)" == yes ]] \
       && uid="$(id -u "$user" 2>/dev/null)"; then
     systemctl start "user@$uid.service" || true
-    echo "user services of $user started again (linger: rootless Docker)"
+    echo "user services of $user running (linger: rootless Docker)"
   fi
 fi
 cat <<EOF
