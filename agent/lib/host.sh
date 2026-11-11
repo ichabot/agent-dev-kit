@@ -74,6 +74,13 @@ adk_apt_install() {
 # adk_user_home USER: home directory from the passwd database
 adk_user_home() { getent passwd "$1" | cut -d: -f6; }
 
+# _adk_close_private_fds: close the descriptors a child running as another user must never
+# inherit: the Gitea admin lock (lib/gitea-admin.sh), which a process of that user could keep
+# open to block every later run. Call it in the subshell that starts the child.
+_adk_close_private_fds() {
+  if [[ -n "${_ADK_GITEA_LOCK_FD:-}" ]]; then exec {_ADK_GITEA_LOCK_FD}>&-; fi
+}
+
 # adk_as_user USER CMD...: run CMD as USER with a minimal environment, cwd = the user's home
 # (the caller's cwd may be unreadable for the user). ADK_AS_USER_HOOK replaces the switch
 # for tests; it is ignored when running as root.
@@ -81,14 +88,14 @@ adk_as_user() {
   local user="$1" home
   shift
   if [[ -n "${ADK_AS_USER_HOOK:-}" && "$(id -u)" -ne 0 ]]; then
-    "$ADK_AS_USER_HOOK" "$user" "$@"
+    (_adk_close_private_fds && exec "$ADK_AS_USER_HOOK" "$user" "$@")
     return
   fi
   home="$(adk_user_home "$user")"
   [[ -n "$home" ]] || adk_die "no home directory for $user"
   # The cd into the home happens as the user, not as root.
   # shellcheck disable=SC2016  # expanded by the inner sh
-  (cd / && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
+  (cd / && _adk_close_private_fds && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
     PATH=/usr/bin:/bin LC_ALL=C sh -c 'cd "$HOME" 2>/dev/null || cd /; exec "$@"' sh "$@")
 }
 
@@ -100,7 +107,7 @@ adk_user_env() {
   uid="$(id -u "$user")"
   home="$(adk_user_home "$user")"
   # shellcheck disable=SC2016  # expanded by the inner sh
-  (cd / && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash \
+  (cd / && _adk_close_private_fds && runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash \
     PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
     sh -c 'cd "$HOME" 2>/dev/null || cd /; exec "$@"' sh "$@")
@@ -322,9 +329,23 @@ adk_deny_cron_at() {
   done
 }
 
+# _adk_group_has_users GID: 0 if a regular account (uid >= ADK_UID_MIN, or a member name that
+# does not resolve) belongs to group GID, listed in the group database or with GID as its
+# primary group. Root and system accounts (e.g. Debian's user mail in group mail) do not count.
+_adk_group_has_users() {
+  local gid="$1" m uid
+  for m in $(getent group "$gid" | cut -d: -f4 | tr ',' ' '); do
+    uid="$(getent passwd "$m" | cut -d: -f3)"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 0
+    ((uid < ADK_UID_MIN)) || return 0
+  done
+  getent passwd | awk -F: -v g="$gid" -v min="$ADK_UID_MIN" '$4 == g && $3 >= min {f = 1} END {exit !f}'
+}
+
 # adk_dir_chain_trusted DIR: DIR and all its parents are real directories that no
-# unprivileged user can change: owned by a system account (or the caller), group-writable
-# only for a system group (or the caller's), other-writable only with the sticky bit
+# unprivileged user can change: owned by a system account (or the caller), group-writable only
+# for a system group without regular users as members (or, for a non-root caller in tests, the
+# caller's own group), other-writable only with the sticky bit
 adk_dir_chain_trusted() {
   local d="$1" me mygid uid gid mode
   me="$(id -u)" mygid="$(id -g)"
@@ -334,7 +355,10 @@ adk_dir_chain_trusted() {
     read -r uid gid mode < <(stat -c '%u %g %a' "$d")
     mode=$((8#$mode))
     ((uid < ADK_UID_MIN || uid == me)) || return 1
-    (((mode & 8#020) == 0 || gid < ADK_UID_MIN || gid == mygid)) || return 1
+    if (((mode & 8#020) != 0)) && ! ((me != 0 && gid == mygid)); then
+      ((gid < ADK_UID_MIN)) || return 1
+      ! _adk_group_has_users "$gid" || return 1
+    fi
     (((mode & 8#002) == 0 || (mode & 8#1000) != 0)) || return 1
     [[ "$d" != / ]] || return 0
     d="$(dirname "$d")"

@@ -76,8 +76,13 @@ refute() {
   [ "$status" -ne 0 ]
 }
 
-@test "adk_ci_wipe: lock, spools, kill, then deletions; home and state recreated empty" {
+@test "adk_ci_wipe: lock, spools, kill, spools again, then deletions; home and state recreated empty" {
   wipe_stubs
+  # a process that was still running writes a crontab during the kill
+  adk_ci_kill() {
+    echo "kill $1 home-present=$([ -d "$HOME_DIR" ] && echo yes) spool=$(find "$T/spool/crontabs" -mindepth 1 | wc -l)" >> "$LOG"
+    printf '* * * * * /bin/late\n' > "$T/spool/crontabs/late"
+  }
   mkdir -p "$HOME_DIR/.config/systemd/user" "$HOME_DIR/.local/share/docker/image" "$T/state/host"
   printf '[Service]\nExecStart=/bin/evil\n' > "$HOME_DIR/.config/systemd/user/evil.service"
   printf 'evil-image\n' > "$HOME_DIR/.local/share/docker/image/tag"
@@ -109,7 +114,7 @@ refute() {
   printf 'x\n' > "$T/scan/f"
   run adk_ci_wipe "$ME" "$T/state"
   [ "$status" -eq 0 ]
-  grep -qE "^$ME find $T/scan -xdev -mindepth 1 \\( -uid $(id -u) -o \\( -uid \\+99999 -uid -165536 \\) \\) -delete\$" "$T/as-uid.log"
+  grep -qE "^$ME timeout --kill-after=10s 300 find $T/scan -xdev -mindepth 1 \\( -uid $(id -u) -o \\( -uid \\+99999 -uid -165536 \\) \\) -delete\$" "$T/as-uid.log"
   # no rm on single names anywhere in the library
   refute grep -nE 'rm -rf[^\n]*"\$r"|while IFS= read -r -d' "$ROOT/agent/lib/ci-runner.sh"
 }
@@ -221,6 +226,111 @@ EOF
   refute adk_dir_chain_trusted "relative/path"
 }
 
+@test "adk_ci_wipe: leftovers of a crashed wipe in the quarantine directory are removed first" {
+  wipe_stubs
+  mkdir -p "$HOME_DIR/sub" "$T/homes/.adk-wipe/$ME.$$/x" "$T/homes/.adk-wipe/other.1"
+  chmod 0700 "$T/homes/.adk-wipe"
+  printf 'old\n' > "$T/homes/.adk-wipe/$ME.$$/x/f"
+  printf 'new\n' > "$HOME_DIR/sub/f"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -eq 0 ]
+  [ -z "$(ls -A "$T/homes/.adk-wipe")" ]
+  [ -d "$HOME_DIR" ] && [ -z "$(ls -A "$HOME_DIR")" ]
+}
+
+@test "adk_ci_wipe: subordinate ranges that overlap another user's or contain an account are refused" {
+  wipe_stubs
+  mkdir -p "$HOME_DIR"
+  printf 'x\n' > "$HOME_DIR/file"
+  printf 'x\n' > "$T/scan/f"
+  printf '%s:100000:65536\nother:150000:65536\n' "$ME" > "$T/subuid-overlap"
+  ADK_SUBUID_FILE="$T/subuid-overlap"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"overlap"* ]]
+  [ -f "$HOME_DIR/file" ] && [ -f "$T/scan/f" ]
+  [ ! -s "$LOG" ]
+  # subgid ranges as well
+  ADK_SUBUID_FILE="$T/subuid1"
+  printf '%s:200000:65536\nother:265000:10\n' "$ME" > "$T/subgid-overlap"
+  ADK_SUBGID_FILE="$T/subgid-overlap"
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"overlap"* ]]
+  # an account whose uid lies inside the subuid range
+  ADK_SUBGID_FILE="$T/subgid1"
+  getent() { if [ "$*" = passwd ]; then printf 'root:x:0:0::/root:/bin/sh\nodd:x:100005:100005::/home/odd:/bin/sh\n'; else command getent "$@"; fi; }
+  run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"100005"* ]]
+  [ -f "$HOME_DIR/file" ]
+}
+
+@test "adk_ci_kill: subordinate ranges that overlap another user's are refused before any kill" {
+  kill_stubs
+  printf 'ci:500000:65536\nother:565535:10\n' > "$T/subuid-ci"
+  run adk_ci_kill ci
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"overlap"* ]]
+  refute grep -q "as-uid" "$LOG"
+}
+
+@test "adk_ci_wipe: the cleanup of the world-writable trees has a time limit and fails closed" {
+  wipe_stubs
+  mkdir -p "$HOME_DIR" "$T/bin"
+  printf 'x\n' > "$HOME_DIR/file"
+  # a find that never ends (e.g. /tmp flooded with millions of files)
+  printf '#!/bin/sh\ncase "$*" in *-delete*) exec sleep 30 ;; esac\nexec /usr/bin/find "$@"\n' > "$T/bin/find"
+  chmod +x "$T/bin/find"
+  ADK_CI_WIPE_TIMEOUT=1 PATH="$T/bin:$PATH" run adk_ci_wipe "$ME" "$T/state"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not finish within 1"* ]]
+  # nothing after it ran: home and state still there, nothing recreated
+  [ -f "$HOME_DIR/file" ]
+}
+
+@test "ci-runner.sh: the default paths are forced when running as root" {
+  run bash -c 'id() { if [ "$#" -eq 1 ] && [ "$1" = -u ]; then echo 0; else command id "$@"; fi; }
+    ADK_RUNNER_STATE=/tmp/s ADK_CGROUP_ROOT=/tmp/c ADK_RUN_USER_DIR=/tmp/r ADK_SYSVIPC_DIR=/tmp/i
+    ADK_RUNNER_CONFIG=/tmp/x ADK_RUNNER_BIN=/tmp/b ADK_CI_WIPE_TIMEOUT=1
+    source "$1/agent/lib/host.sh"; source "$1/agent/lib/ci-runner.sh"
+    echo "$ADK_RUNNER_STATE $ADK_CGROUP_ROOT $ADK_RUN_USER_DIR $ADK_SYSVIPC_DIR $ADK_RUNNER_CONFIG $ADK_RUNNER_BIN $ADK_CI_WIPE_TIMEOUT"' bash "$ROOT"
+  [ "$status" -eq 0 ]
+  [ "$output" = "/var/lib/adk-runner /sys/fs/cgroup /run/user /proc/sysvipc /etc/adk/runner.yaml /usr/local/bin/gitea-runner 300" ]
+}
+
+@test "adk_dir_chain_trusted: group-writable only for a system group without regular users" {
+  mkdir -p "$T/g/x"
+  # $T/g pretends to be group-writable by group 27 (stat stub); members from a getent stub
+  stat() { if [ "${*: -1}" = "$T/g" ]; then echo "0 27 775"; else command stat "$@"; fi; }
+  MEMBERS="" PRIMARY=""
+  getent() {
+    case "$*" in
+      "group 27") printf 'grp:x:27:%s\n' "$MEMBERS" ;;
+      passwd) printf 'root:x:0:0::/root:/bin/sh\nmail:x:8:8::/var/mail:/usr/sbin/nologin\n%s' "$PRIMARY" ;;
+      "passwd root") echo 'root:x:0:0::/root:/bin/sh' ;;
+      "passwd mail") echo 'mail:x:8:8::/var/mail:/usr/sbin/nologin' ;;
+      "passwd alice") echo 'alice:x:1001:1001::/home/alice:/bin/sh' ;;
+      *) return 2 ;;
+    esac
+  }
+  # no members, or only root and system accounts: trusted
+  adk_dir_chain_trusted "$T/g/x"
+  MEMBERS="root,mail"
+  adk_dir_chain_trusted "$T/g/x"
+  # a regular user in the group (listed, or with it as primary group), or an unknown member
+  MEMBERS="root,alice"
+  refute adk_dir_chain_trusted "$T/g/x"
+  MEMBERS="ghost"
+  refute adk_dir_chain_trusted "$T/g/x"
+  MEMBERS="" PRIMARY="$(printf 'bob:x:1002:27::/home/bob:/bin/sh\n')"
+  refute adk_dir_chain_trusted "$T/g/x"
+  # a non-system group is never trusted for group write
+  MEMBERS="" PRIMARY=""
+  stat() { if [ "${*: -1}" = "$T/g" ]; then echo "0 1500 775"; else command stat "$@"; fi; }
+  refute adk_dir_chain_trusted "$T/g/x"
+}
+
 @test "adk_ci_wipe: files of the user elsewhere are reported, not removed by root" {
   wipe_stubs
   mkdir -p "$HOME_DIR"
@@ -266,19 +376,12 @@ EOF
   [ "$status" -ne 0 ]
 }
 
-@test "adk_ci_kill: cgroup.kill below the user slice, kill -1 as the user, then by pid; runtime dir removed; refuses self/root" {
-  run adk_ci_kill "$ME"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"refusing"* ]]
-  run adk_ci_kill root
-  [ "$status" -ne 0 ]
-  # a user other than the caller (stubbed id)
+# kill_stubs: adk_ci_kill against a fake user ci (uid 4242, subuids 500000-565535)
+kill_stubs() {
   id() { if [ "${1:-}" = -u ] && [ "${2:-}" = ci ]; then echo 4242; else command id "$@"; fi; }
   systemctl() { echo "systemctl $*" >> "$LOG"; }
   loginctl() { echo "loginctl $*" >> "$LOG"; }
   _adk_as_uid() { echo "as-uid $*" >> "$LOG"; }
-  # (runs in command substitutions: count in a file) one surviving pid on the first look only
-  _adk_pids_in_ranges() { echo x >> "$T/looks"; [ "$(wc -l < "$T/looks")" -gt 1 ] || echo 999999; }
   kill() { echo "kill $*" >> "$LOG"; }
   sleep() { :; }
   ADK_CGROUP_ROOT="$T/cg"
@@ -291,6 +394,19 @@ EOF
   mountpoint() { return 1; }
   printf 'ci:500000:65536\n' > "$T/subuid-ci"
   ADK_SUBUID_FILE="$T/subuid-ci"
+}
+
+@test "adk_ci_kill: cgroup.kill below the user slice, kill -1 as the user and as each surviving subuid; runtime dir removed; refuses self/root" {
+  run adk_ci_kill "$ME"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing"* ]]
+  run adk_ci_kill root
+  [ "$status" -ne 0 ]
+  kill_stubs
+  # (runs in command substitutions: count in a file) survivors with subuid 500001 on the first
+  # look only
+  _adk_uids_in_ranges() { echo x >> "$T/looks"; [ "$(wc -l < "$T/looks")" -gt 1 ] || echo 500001; }
+  _adk_pids_in_ranges() { :; }
   run adk_ci_kill ci
   [ "$status" -eq 0 ]
   [ "$(cat "$S/user@4242.service/cgroup.kill")" = "1" ]
@@ -300,8 +416,40 @@ EOF
   grep -qx "systemctl stop user-runtime-dir@4242.service" "$LOG"
   [ ! -e "$T/run-user/4242" ]
   grep -qx "as-uid ci kill -s KILL -- -1" "$LOG"
-  grep -qx "kill -KILL 999999" "$LOG"
+  # the subuid survivor: kill -1 with its own uid (no pid list that could hit a reused pid)
+  grep -qx "as-uid 500001 kill -s KILL -- -1" "$LOG"
+  refute grep -q "^kill " "$LOG"
   grep -qx "systemctl stop user@4242.service" "$LOG"
+}
+
+@test "adk_ci_kill: surviving processes leave /run/user/<uid> alone" {
+  kill_stubs
+  _adk_uids_in_ranges() { echo 500001; }
+  _adk_pids_in_ranges() { echo 999999; }
+  printf 'job state\n' > "$T/run-user/4242/f"
+  run adk_ci_kill ci
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"processes of ci survive"* ]]
+  [ -f "$T/run-user/4242/f" ]
+  refute grep -q "user-runtime-dir@4242" "$LOG"
+}
+
+@test "_adk_uids_in_ranges: distinct real or effective uids inside the ranges" {
+  mkdir -p "$T/bin"
+  printf '#!/bin/sh\nprintf "100000 100000\\n1000 1000\\n165535 0\\n99999 99999\\n0 100001\\n100000 100000\\n"\n' > "$T/bin/ps"
+  chmod +x "$T/bin/ps"
+  PATH="$T/bin:$PATH" run _adk_uids_in_ranges 100000-165535 1000-1000
+  [ "$output" = "$(printf '1000\n100000\n100001\n165535')" ]
+}
+
+@test "_adk_as_uid: a bare number runs with that uid and gid; never root" {
+  unset ADK_AS_UID_HOOK
+  id() { if [ "$#" -eq 1 ] && [ "$1" = -u ]; then echo 0; else command id "$@"; fi; }
+  env() { echo "env $*" >> "$LOG"; }
+  _adk_as_uid 500001 kill -s KILL -- -1
+  grep -qE "^env -i .* setpriv --reuid=500001 --regid=500001 --clear-groups -- kill -s KILL -- -1$" "$LOG"
+  run _adk_as_uid 0 true
+  [ "$status" -ne 0 ]
 }
 
 @test "_adk_ipc_clean removes SysV objects owned or created by the ranges, by id" {

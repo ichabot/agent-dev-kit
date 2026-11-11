@@ -235,9 +235,12 @@ gesetzt oder Startpasswort-Datei noch vorhanden), wird das Kennzeichen „muss P
 ändern“ dafür kurz aufgehoben und am Ende **zuerst** wieder gesetzt – auch wenn der Lauf
 scheitert. Eine Markierungsdatei (`/root/.adk-gitea-must-change-pending`) sorgt dafür, dass
 nach einem abgebrochenen Lauf der nächste das Kennzeichen wieder setzt. Es läuft immer nur
-eines der beiden Skripte (Sperre `/run/adk-gitea-admin.lock`, ein zweiter Lauf wartet); jeder
+eines der beiden Skripte (Sperre `/run/adk/gitea-admin.lock`, ein zweiter Lauf wartet); jeder
 Lauf hat einen eigenen Token-Namen, löscht am Anfang übrig gebliebene `adk-init-*`-Tokens
-abgebrochener Läufe und am Ende sein eigenes.
+abgebrochener Läufe und am Ende sein eigenes. Die Sperrdatei liegt in einem Verzeichnis nur
+für root (0700, Datei 0600, keine Symlinks, Besitzer geprüft), und Prozesse, die die Skripte
+als `hermes` oder `ci` starten, erben sie nicht: Der Agent kann die Sperre weder nehmen noch
+festhalten und so die Skripte nicht blockieren.
 
 ### Erste Anmeldung des Mitarbeiters
 
@@ -268,12 +271,17 @@ Socket kann ein Job alles, was `ci` kann: andere Container starten, Pfade einbin
   1. Konto von `ci` abgelaufen setzen (`usermod -L -e 1`) und Linger aus: Cron, `at` und der
      User-Manager von systemd starten für `ci` nichts mehr. Einträge von `ci` in den Spools
      von Cron, `at` und Mail löscht root direkt (`find … -delete`, nur in Verzeichnissen, die
-     kein normaler Benutzer ändern kann). `ci` steht außerdem seit dem Setup in
-     `/etc/cron.deny` und `/etc/at.deny`.
+     kein normaler Benutzer ändern kann – gruppenschreibbar nur für eine Systemgruppe ohne
+     normale Benutzer als Mitglieder), vor und noch einmal nach dem Beenden der Prozesse. `ci`
+     steht außerdem seit dem Setup in `/etc/cron.deny` und `/etc/at.deny`. Die Sub-UID- und
+     Sub-GID-Bereiche von `ci` dürfen sich mit keinem anderen Eintrag überschneiden und kein
+     bestehendes Konto bzw. keine Gruppe enthalten, sonst bricht der Wipe vor jeder Aktion ab.
   2. User-Manager stoppen, Sitzungen beenden, dann alle Prozesse beenden: `cgroup.kill` der
      `user-<uid>.slice` (rootless Docker, Container, User-Units – der Kernel erwischt auch
      gerade geforkte Prozesse), `kill -KILL -1` als `ci` (alle Prozesse mit dessen uid in einem
-     Durchgang), Reste der Sub-UIDs per PID; danach wird geprüft, dass nichts übrig ist.
+     Durchgang), dann ebenso `kill -KILL -1` mit jeder Sub-UID, die noch Prozesse hat (nie per
+     PID: eine PID kann inzwischen einem anderen Prozess gehören); danach wird geprüft, dass
+     nichts übrig ist. Erst dann wird `/run/user/<uid>` von `ci` ausgehängt und entfernt.
      SysV-IPC-Objekte (Shared Memory, Semaphoren, Message Queues) von `ci`/Sub-UIDs werden
      per ID entfernt.
   3. Dateien von `ci`/Sub-UIDs in `/tmp`, `/var/tmp`, `/dev/shm`, `/dev/mqueue`, `/run/lock`
@@ -281,10 +289,13 @@ Socket kann ein Job alles, was `ci` kann: andere Container starten, Pfade einbin
      Sub-UIDs löschen), mit `find -delete`: root handelt nie auf Pfadnamen in Verzeichnissen,
      die `ci` oder `hermes` ändern können. Ein Verzeichnis, das währenddessen gegen einen
      Symlink getauscht wird, wird höchstens als Link entfernt – und auch dann nur mit den
-     Rechten von `ci` (im Integrationstest mit einem Tausch-Angriff geprüft).
+     Rechten von `ci` (im Integrationstest mit einem Tausch-Angriff geprüft). Jede Suche hat
+     ein Zeitlimit (300 s); wird es erreicht, bricht der Wipe ab und es startet kein weiterer
+     Job (siehe „Bekanntes Restrisiko“ unten).
   4. Home von `ci` (Docker-Daten, Images, Build-Cache, `~/.config/systemd/user`, Caches) und
      `/var/lib/adk-runner` (mit der Registrierungsdatei) werden erst in ein root-eigenes
-     Verzeichnis (0700) verschoben und dann gelöscht; beide leer neu anlegen. Übrige Dateien
+     Verzeichnis (0700) verschoben und dann gelöscht (Reste eines abgebrochenen Wipes dort
+     vorher); beide leer neu anlegen. Übrige Dateien
      von `ci` irgendwo sonst meldet der Schritt als `WARNING` im Journal, ohne sie anzufassen.
 - Vor dem nächsten Job: Konto wieder gültig und Linger an, rootless Docker für `ci` neu
   einrichten (Dateien im Home schreibt `ci` selbst), Job-Image per Digest ziehen, neu
@@ -299,6 +310,14 @@ Registrierung (die Datei ist während des Jobs lesbar, gilt aber nur für genau 
 Nicht gelöscht werden die Kernel-Keyrings von `ci` (`keyctl`); in Job-Containern verbietet
 Dockers Standard-Seccomp-Profil `keyctl`/`add_key`, ein Job kommt also nur über einen
 Umweg (User-Unit auf dem Host) daran, und Schlüssel dort laufen nach einigen Tagen ab.
+
+**Bekanntes Restrisiko (bewusst akzeptiert):** Der Agent (oder ein Job) kann `/tmp` & Co. mit
+sehr vielen Dateien fluten. Dann erreicht die Suche des Wipes ihr Zeitlimit, der Wipe bricht
+ab und der Runner nimmt keinen Job mehr an, bis jemand aufräumt (Journal von
+`adk-act-runner.service`: „did not finish within 300s“). Das ist ein Ausfall der CI, kein
+Durchgriff: Ein Job läuft nie auf einem nicht vollständig gesäuberten Zustand. Abhilfe: die
+Dateien als ihr Besitzer löschen (z. B. `sudo -u hermes find /tmp -user hermes -delete`),
+dann `systemctl restart adk-act-runner.service`.
 
 **Laufzeitgrenze:** Ein Runner-Lauf endet spätestens nach `RuntimeMaxSec=190min` (Job-Timeout
 3 h plus Reserve), auch wenn Job oder Runner hängen; der Wipe läuft dann trotzdem
@@ -360,7 +379,9 @@ Täglich um 03:30 schreibt `agent/backup.sh` nach `/var/backups/adk/<UTC-Zeit>/`
   auch bei Fehlern, wenn das Skript abgebrochen wird oder der Server währenddessen
   herunterfährt (`ExecStopPost=backup.sh --ensure-gitea` startet Gitea, wenn eine
   Markierungsdatei zeigt, dass das Backup es gestoppt hat; nach Absturz oder Stromausfall
-  macht das `adk-backup-recover.service` beim nächsten Start). So schreibt während des Dumps
+  macht das `adk-backup-recover.service` beim nächsten Start). Vor jedem Neustart wird ein
+  übrig gebliebener Dump-Container entfernt (`docker rm -f`), damit nie Dump und Gitea
+  gleichzeitig auf denselben Daten arbeiten. So schreibt während des Dumps
   niemand (keine Pushes des Agenten, keine Jobs); Gitea ist dafür einige Sekunden bis Minuten
   nicht erreichbar, ein um 03:30 laufender Job kann daran scheitern.
 - `adk-secrets.tar`: `/opt/adk/secrets` + `kit.env`.
@@ -594,6 +615,14 @@ noch seinen SSH-Zugang, Schritte 5–6 noch das API-Token.
   Backup unter dem Namen des neueren, Chiffrat eines anderen Backups. Gitea läuft wieder nach
   `kill -9` des Backups während des Dumps, nach `systemctl stop` und nach einem Neustart des
   Servers mit zurückgebliebener Markierung (`adk-backup-recover.service`).
+- `make check`, Review-Runde 3: Admin-Sperre (Verzeichnis 0700, Datei 0600 auch bei Umask
+  022, Symlink/fremder Besitzer/falscher Modus abgelehnt, Deskriptor erreicht kein Kind, das
+  als anderer Benutzer läuft: `adk_as_user`, `adk_user_env`, `user-file.sh`, `setpriv`);
+  `/run/user/<ci>` bleibt unangetastet, solange Prozesse leben; `kill -1` je Sub-UID statt
+  PID-Liste; Spools auch nach dem Kill; Reste in `.adk-wipe`; überlappende Sub-ID-Bereiche
+  und Konten im Bereich abgelehnt; gruppenschreibbare Verzeichnisse nur ohne normale
+  Mitglieder; Standardpfade als root erzwungen; Zeitlimit der Wipe-Suche (bricht ab);
+  Dump-Container vor jedem Neustart von Gitea entfernt.
 - Noch nicht geprüft (PR 6, E2E): echter Hetzner-API-Lauf, ACME mit echtem DNS-Anbieter,
   Off-Site-Backup auf eine Storage Box (Host-Key-Fingerprint von Hetzner), Port-Scan von außen
   durch die Hetzner-Firewall.

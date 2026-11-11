@@ -25,7 +25,7 @@ for i, (name, perm) in enumerate((("Owners", "owner"), ("developers", "write"), 
                                "includes_all_repositories": name == "Owners", "permission": perm}
 json.dump(s, open(p, "w"))' "$FAKE_STATE"
   : > "$FAKE_LOG"
-  export ADK_GITEA_LOCK="$BATS_TEST_TMPDIR/gitea-admin.lock"
+  export ADK_GITEA_LOCK_DIR="$BATS_TEST_TMPDIR/run-adk"
 }
 
 st() {

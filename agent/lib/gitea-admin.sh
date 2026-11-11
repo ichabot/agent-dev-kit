@@ -5,16 +5,18 @@
 # deleted again by adk_gitea_admin_end (call it from an EXIT trap).
 # Requires host.sh sourced. Names used in SQL are validated by check-config.sh / the callers.
 #
-# Test overrides (non-root only, see tests/gitea-init.bats): ADK_TEST_PASSWORD_FILE,
-# ADK_GITEA_LOCK, ADK_GITEA_LOCK_WAIT.
+# Test overrides (non-root only, see tests/gitea-init.bats, tests/gitea-admin.bats):
+# ADK_TEST_PASSWORD_FILE, ADK_GITEA_LOCK_DIR, ADK_GITEA_LOCK_WAIT.
 
 ADK_GITEA_COMPOSE_FILE=/opt/adk/services/compose.yaml
 ADK_GITEA_PASSWORD_FILE=/root/adk-gitea-initial-password
 # One kit script with admin access at a time (gitea-init.sh, protect-repo.sh): a second run
-# waits. /run is root-only writable (never /run/lock or /tmp: others could plant a symlink).
-ADK_GITEA_LOCK="${ADK_GITEA_LOCK:-/run/adk-gitea-admin.lock}"
+# waits. The lock file lives in a root-only directory (0700) and is 0600: no other user can
+# open it, so nobody else can take (and keep) the lock to block these scripts. Never /run/lock
+# or /tmp: others could plant a symlink or hold the lock there.
+ADK_GITEA_LOCK_DIR="${ADK_GITEA_LOCK_DIR:-/run/adk}"
 ADK_GITEA_LOCK_WAIT="${ADK_GITEA_LOCK_WAIT:-600}"
-[[ "$(id -u)" -ne 0 ]] || ADK_GITEA_LOCK=/run/adk-gitea-admin.lock
+[[ "$(id -u)" -ne 0 ]] || ADK_GITEA_LOCK_DIR=/run/adk
 
 gx() { docker compose -f "$ADK_GITEA_COMPOSE_FILE" exec -T -u git gitea "$@"; }
 gitea_cli() { gx gitea "$@"; }
@@ -50,18 +52,38 @@ json() { python3 -I -c 'import json, sys; d = json.loads(sys.argv[1]); print(eva
 # for the run and adk_gitea_admin_end sets it again FIRST (before anything that can fail).
 # A marker file next to the password file survives a crash or SIGKILL in between: the next
 # run sees it and sets the flag again. An existing password file (not handed over yet) also
-# means "must change". Runs are serialized by a lock (ADK_GITEA_LOCK), so leftover adk-init-*
+# means "must change". Runs are serialized by a lock (ADK_GITEA_LOCK_DIR), so leftover adk-init-*
 # tokens of killed runs can be deleted at the start; at the end a run deletes its own token
 # (name unique per run).
 _ADK_GITEA_ADMIN="" _ADK_SET_MUST_CHANGE=false _ADK_TMP_TOKEN_NAME="" _ADK_GITEA_LOCK_FD=""
 
-# _adk_gitea_lock: take the admin lock for the rest of the process (waits ADK_GITEA_LOCK_WAIT s)
+# _adk_gitea_lock: take the admin lock for the rest of the process (waits ADK_GITEA_LOCK_WAIT s).
+# Directory and file must belong to the caller (root) with modes 0700/0600 and must not be
+# symlinks; the file is created under umask 077 and checked on the open descriptor. Children
+# that run as another user never inherit the descriptor (_adk_close_private_fds in host.sh).
 _adk_gitea_lock() {
+  local dir="$ADK_GITEA_LOCK_DIR" lock me old
   [[ -z "$_ADK_GITEA_LOCK_FD" ]] || return 0
-  [[ ! -L "$ADK_GITEA_LOCK" ]] || adk_die "$ADK_GITEA_LOCK is a symlink"
-  exec {_ADK_GITEA_LOCK_FD}>> "$ADK_GITEA_LOCK"
+  lock="$dir/gitea-admin.lock" me="$(id -u)"
+  [[ ! -L "$dir" ]] || adk_die "$dir is a symlink"
+  [[ -e "$dir" ]] || (umask 077 && mkdir -- "$dir") || adk_die "cannot create $dir"
+  [[ -d "$dir" && ! -L "$dir" && "$(stat -c '%u %a' -- "$dir")" == "$me 700" ]] \
+    || adk_die "$dir must be a directory of uid $me with mode 0700 (not a symlink)"
+  [[ ! -L "$lock" ]] || adk_die "$lock is a symlink"
+  # (a fifo would block the open)
+  [[ ! -e "$lock" || -f "$lock" ]] || adk_die "$lock must be a regular file of uid $me with mode 0600"
+  old="$(umask)"
+  umask 077
+  if ! exec {_ADK_GITEA_LOCK_FD}>> "$lock"; then
+    umask "$old"
+    _ADK_GITEA_LOCK_FD=""
+    adk_die "cannot open $lock"
+  fi
+  umask "$old"
+  [[ "$(stat -L -c '%u %a %F' "/dev/fd/$_ADK_GITEA_LOCK_FD")" == "$me 600 regular"* ]] \
+    || adk_die "$lock must be a regular file of uid $me with mode 0600"
   flock -w "$ADK_GITEA_LOCK_WAIT" "$_ADK_GITEA_LOCK_FD" \
-    || adk_die "another kit script is using the Gitea admin access ($ADK_GITEA_LOCK); try again later"
+    || adk_die "another kit script is using the Gitea admin access ($lock); try again later"
 }
 
 adk_gitea_must_change_marker() { printf '%s/.adk-gitea-must-change-pending' "$(dirname "$ADK_GITEA_PASSWORD_FILE")"; }

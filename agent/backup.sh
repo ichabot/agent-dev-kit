@@ -12,7 +12,7 @@
 #                       and if it is killed (or the server shuts down meanwhile) by
 #                       --ensure-gitea, which adk-backup.service runs as ExecStopPost and
 #                       adk-backup-recover.service at boot (a marker file records that the
-#                       backup stopped Gitea)
+#                       backup stopped Gitea); a dump container left over is removed first
 #   adk-secrets.tar     /opt/adk/secrets and /opt/adk/kit.env
 #   hermes-home.tar.gz  home of hermes, packed AS hermes (tar never follows symlinks; root never
 #                       reads in that home); without caches (.cache, node_modules), the rootless
@@ -99,9 +99,12 @@ GITEA_MARKER="$BACKUP_ROOT/.gitea-stopped-by-backup"
 compose() { docker compose -f "$COMPOSE_FILE" --project-directory "$SERVICES_DIR" "$@"; }
 log() { echo "backup: $*"; }
 
-# start_gitea_if_stopped: start Gitea if a backup stopped it (marker), then drop the marker
+# start_gitea_if_stopped: start Gitea if a backup stopped it (marker), then drop the marker.
+# The one-off dump container goes first: if it outlived its run (killed script, timeout), it
+# would still work on the data Gitea is about to use.
 start_gitea_if_stopped() {
   [[ -e "$GITEA_MARKER" ]] || return 0
+  docker rm -f "$DUMP_CONTAINER" > /dev/null 2>&1 || true
   if compose start gitea > /dev/null 2>&1 || compose up -d gitea > /dev/null 2>&1; then
     rm -f "$GITEA_MARKER"
     log "gitea started again"

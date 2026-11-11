@@ -7,10 +7,12 @@
 #
 #   wipe     expire ci's account and drop its linger (cron, at and the user manager refuse it
 #            from now on), delete ci's cron/at/mail spool entries, kill every process of ci
-#            and of its subordinate uids (cgroup.kill of user-<uid>.slice, kill -1 as ci, then
-#            by pid), remove its SysV IPC objects, delete its files in the world-writable
-#            trees (/tmp, /var/tmp, /dev/shm, /dev/mqueue, /run/lock) AS ci inside its own user
-#            namespace, delete ci's home and the runner state directory, recreate both empty
+#            and of its subordinate uids (cgroup.kill of user-<uid>.slice, kill -1 as ci and
+#            as each subordinate uid that still has processes), delete the spool entries again,
+#            remove its SysV IPC objects, delete its files in the world-writable trees (/tmp,
+#            /var/tmp, /dev/shm, /dev/mqueue, /run/lock) AS ci inside its own user namespace
+#            (time limit, fails closed), delete ci's home and the runner state directory,
+#            recreate both empty
 #   prepare  wipe, re-enable the account and linger, set up rootless Docker for ci again
 #            (files in the home written AS ci), pull the pinned job image, register a new
 #            ephemeral runner with a NEW registration token (Gitea CLI -> pipe -> environment
@@ -54,6 +56,15 @@ ADK_CI_SCAN_PRUNE=(/proc /sys /dev/pts /home /root /opt/adk /var/lib/adk /var/ba
 ADK_CGROUP_ROOT="${ADK_CGROUP_ROOT:-/sys/fs/cgroup}"
 ADK_SYSVIPC_DIR="${ADK_SYSVIPC_DIR:-/proc/sysvipc}"
 ADK_RUN_USER_DIR="${ADK_RUN_USER_DIR:-/run/user}"
+# Time limit (seconds) of each search in the wipe: a flooded /tmp must not stall it for ever.
+# The cleanup of the world-writable trees fails closed (no next job) when it is reached.
+ADK_CI_WIPE_TIMEOUT="${ADK_CI_WIPE_TIMEOUT:-300}"
+# The overrides above are for tests (non-root) only: as root the defaults always apply.
+if [[ "$(id -u)" -eq 0 ]]; then
+  ADK_RUNNER_CONFIG=/etc/adk/runner.yaml ADK_RUNNER_STATE=/var/lib/adk-runner
+  ADK_RUNNER_BIN=/usr/local/bin/gitea-runner ADK_CGROUP_ROOT=/sys/fs/cgroup
+  ADK_SYSVIPC_DIR=/proc/sysvipc ADK_RUN_USER_DIR=/run/user ADK_CI_WIPE_TIMEOUT=300
+fi
 
 # _adk_pids_in_ranges RANGES...: pids whose real or effective uid lies in one of the ranges
 _adk_pids_in_ranges() {
@@ -62,18 +73,59 @@ _adk_pids_in_ranges() {
     { for (i = 1; i <= n; i++) if (($2 >= lo[i] && $2 <= hi[i]) || ($3 >= lo[i] && $3 <= hi[i])) { print $1; next } }'
 }
 
-# _adk_as_uid USER CMD...: run CMD with USER's uid and gid, no supplementary groups, a minimal
-# environment, cwd / (setpriv: no PAM, so it also works while the account is expired).
-# ADK_AS_UID_HOOK replaces the switch for tests; it is ignored when running as root.
+# _adk_uids_in_ranges RANGES...: distinct real or effective uids inside the ranges of all
+# processes (one per line, sorted)
+_adk_uids_in_ranges() {
+  ps -eo ruid=,euid= | awk -v r="$*" '
+    BEGIN { n = split(r, a, " "); for (i = 1; i <= n; i++) { split(a[i], b, "-"); lo[i] = b[1]; hi[i] = b[2] } }
+    { for (j = 1; j <= 2; j++) for (i = 1; i <= n; i++) if ($j >= lo[i] && $j <= hi[i]) { print $j; break } }' | sort -un
+}
+
+# _adk_ci_ranges_exclusive USER UID: USER's /etc/subuid and /etc/subgid ranges overlap no range
+# of another entry, and no account (uid) or group (gid) lies inside them. The kill and the wipe
+# act on every id in these ranges; an overlap would let them hit another user. Dies otherwise.
+_adk_ci_ranges_exclusive() {
+  local user="$1" uid="$2" kind file mine others ids r o
+  for kind in uid gid; do
+    if [[ "$kind" == uid ]]; then file="$ADK_SUBUID_FILE"; else file="$ADK_SUBGID_FILE"; fi
+    [[ -r "$file" ]] || continue
+    mine="$(adk_subid_ranges "$file" "$user" "$uid")"
+    [[ -n "$mine" ]] || continue
+    others="$(awk -F: -v u="$user" -v id="$uid" '!($1 == u || $1 == id) && $2 ~ /^[0-9]+$/ && $3 ~ /^[1-9][0-9]*$/ {printf "%d-%d\n", $2, $2 + $3 - 1}' "$file")"
+    for r in $mine; do
+      for o in $others; do
+        ((${r%-*} > ${o#*-} || ${o%-*} > ${r#*-})) \
+          || adk_die "the sub${kind} range $r of $user overlaps $o of another entry in $file"
+      done
+    done
+    if [[ "$kind" == uid ]]; then ids="$(getent passwd | cut -d: -f3)"; else ids="$(getent group | cut -d: -f3)"; fi
+    for o in $ids; do
+      [[ "$o" =~ ^[0-9]+$ ]] || continue
+      for r in $mine; do
+        ((o < ${r%-*} || o > ${r#*-})) || adk_die "${kind} $o (an existing account or group) lies inside the sub${kind} range $r of $user"
+      done
+    done
+  done
+}
+
+# _adk_as_uid USER|UID CMD...: run CMD with USER's uid and gid (a bare number: that uid and the
+# same number as gid, e.g. a subordinate uid), no supplementary groups, a minimal environment,
+# cwd / (setpriv: no PAM, so it also works while the account is expired). The Gitea admin lock
+# is never inherited. ADK_AS_UID_HOOK replaces the switch for tests; ignored as root.
 _adk_as_uid() {
   local user="$1" uid gid
   shift
   if [[ -n "${ADK_AS_UID_HOOK:-}" && "$(id -u)" -ne 0 ]]; then
-    "$ADK_AS_UID_HOOK" "$user" "$@"
+    (_adk_close_private_fds && exec "$ADK_AS_UID_HOOK" "$user" "$@")
     return
   fi
-  uid="$(id -u "$user")" gid="$(id -g "$user")"
-  (cd / && env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+  if [[ "$user" =~ ^[1-9][0-9]*$ ]]; then
+    uid="$user" gid="$user"
+  else
+    uid="$(id -u "$user")" gid="$(id -g "$user")"
+  fi
+  [[ "$uid" != 0 ]] || adk_die "refusing to run a command as root through _adk_as_uid"
+  (cd / && _adk_close_private_fds && env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
     setpriv --reuid="$uid" --regid="$gid" --clear-groups -- "$@")
 }
 
@@ -97,7 +149,8 @@ _adk_user_cgroups_kill() {
 
 # _adk_runtime_dir_gone UID: /run/user/UID (a tmpfs of the user, with whatever a job put there)
 # is unmounted and removed: stop user-runtime-dir@UID, and if it still exists unmount it and
-# remove it (its parent /run/user belongs to root, nobody else can swap the path)
+# remove it (its parent /run/user belongs to root, nobody else can swap the path). Only after
+# adk_ci_kill verified that no process of the user is left.
 _adk_runtime_dir_gone() {
   local uid="$1" dir="$ADK_RUN_USER_DIR/$1"
   systemctl reset-failed "user-runtime-dir@$uid.service" > /dev/null 2>&1 || true
@@ -124,30 +177,34 @@ adk_ci_unlock() {
 }
 
 # adk_ci_kill USER: stop USER's user manager and sessions, kill all processes of USER and of
-# its subordinate uids (rootless containers). Returns 1 if processes survive.
+# its subordinate uids (rootless containers). Returns 1 if processes survive; /run/user/<uid> is
+# touched only when none is left.
 adk_ci_kill() {
-  local user="$1" uid ranges pids i
+  local user="$1" uid ranges uids u i
   uid="$(id -u "$user")"
   [[ "$uid" != "$(id -u)" && "$uid" != 0 ]] || adk_die "refusing to kill the processes of $user (the caller or root)"
+  _adk_ci_ranges_exclusive "$user" "$uid"
   ranges="$uid-$uid $(adk_subid_ranges "$ADK_SUBUID_FILE" "$user" "$uid" | tr '\n' ' ')"
   systemctl stop "user@$uid.service" > /dev/null 2>&1 || true
   loginctl terminate-user "$user" > /dev/null 2>&1 || true
-  # shellcheck disable=SC2086  # one range per word
   for ((i = 0; i < 20; i++)); do
-    # everything under the user's slice (user manager, rootless Docker, containers) at once
+    # everything under the user's slice (user manager, rootless Docker, containers) at once,
     # then every process with USER's uid anywhere (kill -1 as USER: the kernel walks all
-    # processes in one pass), then the subuid processes outside the slice by pid
+    # processes in one pass), then the same as each subordinate uid that still has processes
+    # (never by pid: a pid can be reused between listing and kill)
     _adk_user_cgroups_kill "$uid"
     _adk_as_uid "$user" kill -s KILL -- -1 > /dev/null 2>&1 || true
-    pids="$(_adk_pids_in_ranges $ranges)"
-    [[ -n "$pids" ]] || break
-    # shellcheck disable=SC2086  # one pid per word
-    kill -KILL $pids 2> /dev/null || true
+    # shellcheck disable=SC2086  # one range per word
+    uids="$(_adk_uids_in_ranges $ranges)"
+    [[ -n "$uids" ]] || break
+    for u in $uids; do
+      _adk_as_uid "$u" kill -s KILL -- -1 > /dev/null 2>&1 || true
+    done
     sleep 0.5
   done
-  _adk_runtime_dir_gone "$uid"
   # shellcheck disable=SC2086  # one range per word
   [[ -z "$(_adk_pids_in_ranges $ranges)" ]] || { echo "ERROR: processes of $user survive: $(_adk_pids_in_ranges $ranges | tr '\n' ' ')" >&2; return 1; }
+  _adk_runtime_dir_gone "$uid"
 }
 
 # _adk_ci_owner_expr UID RANGES...: find expression "owned by UID or a uid in RANGES" (array
@@ -220,9 +277,11 @@ _adk_ci_ns_prefix() {
 # uids below each DIR - as USER, inside its own user namespace (there USER may delete files of
 # its subuids). find -delete works relative to directory file descriptors and never follows a
 # symlink; a directory swapped for a symlink meanwhile is at most removed as a link, and
-# whatever happens, it happens with the rights of USER only.
+# whatever happens, it happens with the rights of USER only. Each search ends after
+# ADK_CI_WIPE_TIMEOUT seconds (e.g. /tmp flooded by another user); then the wipe dies: no next
+# job on a state that may not be clean.
 _adk_ci_ns_delete() {
-  local user="$1" self=0 d
+  local user="$1" self=0 d rc
   shift
   _adk_ci_ns_prefix "$user"
   if [[ -n "${ADK_AS_UID_HOOK:-}" && "$(id -u)" -ne 0 ]]; then
@@ -232,7 +291,10 @@ _adk_ci_ns_delete() {
   _adk_ci_owner_expr "$self" "$ADK_NS_RANGE"
   for d in "$@"; do
     [[ -d "$d" && ! -L "$d" ]] || continue
-    _adk_as_uid "$user" "${ADK_NS_PREFIX[@]}" find "$d" -xdev -mindepth 1 "${ADK_OWNER_EXPR[@]}" -delete 2> /dev/null || true
+    rc=0
+    _adk_as_uid "$user" timeout --kill-after=10s "$ADK_CI_WIPE_TIMEOUT" "${ADK_NS_PREFIX[@]}" \
+      find "$d" -xdev -mindepth 1 "${ADK_OWNER_EXPR[@]}" -delete 2> /dev/null || rc=$?
+    ((rc != 124 && rc != 137)) || adk_die "the cleanup of $d did not finish within ${ADK_CI_WIPE_TIMEOUT}s; not starting another job"
   done
 }
 
@@ -249,6 +311,9 @@ _adk_rm_quarantined() {
   [[ ! -L "$q" ]] || adk_die "$q is a symlink"
   install -d -m 0700 "$q"
   [[ "$(stat -c '%u %a' "$q")" == "$(id -u) 700" ]] || adk_die "$q must be a directory of $(id -un) with mode 0700"
+  # leftovers of a crashed run (only root can reach them: the directory is root-only)
+  find "$q" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + 2> /dev/null || true
+  [[ -z "$(ls -A "$q")" ]] || adk_die "cannot empty $q"
   mv -T -- "$path" "$q/$(basename "$path").$$"
   rm -rf --one-file-system -- "${q:?}/$(basename "$path").$$"
 }
@@ -258,16 +323,19 @@ _adk_rm_quarantined() {
 # home and STATE_DIR, report any file of USER that survived elsewhere, recreate home and
 # STATE_DIR empty (USER, 0700).
 adk_ci_wipe() {
-  local user="$1" state="$2" uid home ranges=() prune=() p left
+  local user="$1" state="$2" uid home ranges=() prune=() p left rc
   uid="$(id -u "$user")"
   home="$(adk_user_home "$user")"
   [[ "$home" == /?*/?* && "$home" != *//* && "$home" != */./* && "$home" != */../* ]] || adk_die "unexpected home of $user: $home"
   [[ "$state" == /?*/?* && "$state" != *//* && "$state" != */./* && "$state" != */../* ]] || adk_die "unexpected state directory: $state"
+  _adk_ci_ranges_exclusive "$user" "$uid"
   mapfile -t ranges < <(adk_subid_ranges "$ADK_SUBUID_FILE" "$user" "$uid")
-  # nothing of the user may start by itself any more (cron, at, linger), then the spools
+  # nothing of the user may start by itself any more (cron, at, linger), then the spools; again
+  # after the kill (a process still running meanwhile could have added an entry)
   adk_ci_lock "$user"
   _adk_ci_clean_spools "$uid" "${ranges[@]}"
   adk_ci_kill "$user" || adk_die "cannot stop all processes of $user"
+  _adk_ci_clean_spools "$uid" "${ranges[@]}"
   _adk_ipc_clean "$uid-$uid" "${ranges[@]}"
   _adk_ci_ns_delete "$user" "${ADK_CI_TMP_DIRS[@]}"
   _adk_rm_quarantined "$home"
@@ -279,7 +347,9 @@ adk_ci_wipe() {
   _adk_ci_owner_expr "$uid" "${ranges[@]}"
   for p in "${ADK_CI_SCAN_PRUNE[@]}"; do prune+=(-path "$p" -o); done
   prune+=(-path "$(dirname "$home")" -o -path "$(dirname "$state")/.adk-wipe")
-  left="$(find "${ADK_CI_SCAN_DIRS[@]}" -mindepth 1 -xdev \( "${prune[@]}" \) -prune -o "${ADK_OWNER_EXPR[@]}" -print -quit 2> /dev/null || true)"
+  rc=0
+  left="$(timeout --kill-after=10s "$ADK_CI_WIPE_TIMEOUT" find "${ADK_CI_SCAN_DIRS[@]}" -mindepth 1 -xdev \( "${prune[@]}" \) -prune -o "${ADK_OWNER_EXPR[@]}" -print -quit 2> /dev/null)" || rc=$?
+  ((rc != 124 && rc != 137)) || echo "WARNING: the search for files of $user that survived the wipe did not finish within ${ADK_CI_WIPE_TIMEOUT}s" >&2
   [[ -z "$left" ]] || echo "WARNING: a file of $user survived the wipe (not removed by root on purpose): $(printf '%q' "$left")" >&2
   install -d -m 0700 -o "$user" -g "$user" "$home"
   install -d -m 0700 -o "$user" -g "$user" "$state"

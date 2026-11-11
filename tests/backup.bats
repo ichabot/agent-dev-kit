@@ -291,6 +291,16 @@ offsite_config() {
   [ "$status" -eq 0 ]
   [ "$(grep -c '^compose start gitea' "$FAKE_LOG")" -eq 1 ]
   [ ! -e "$ADK_BACKUP_DIR/.gitea-stopped-by-backup" ]
+  # a dump container that outlived the killed run is removed BEFORE Gitea starts again (never
+  # two processes on the same data)
+  [ "$(grep -nE '^(rm -f adk-backup-dump|compose start gitea)' "$FAKE_LOG" | cut -d: -f2-)" = "$(printf 'rm -f adk-backup-dump\ncompose start gitea')" ]
+}
+
+@test "every restart of gitea after the dump removes the dump container first" {
+  run "$BACKUP"
+  [ "$status" -eq 0 ]
+  [ "$(grep -E '^(rm -f adk-backup-dump|run \(one-off container\)|compose start gitea)' "$FAKE_LOG" | tail -n 3)" \
+    = "$(printf 'run (one-off container)\nrm -f adk-backup-dump\ncompose start gitea')" ]
 }
 
 @test "a killed backup run starts gitea again (signal trap)" {

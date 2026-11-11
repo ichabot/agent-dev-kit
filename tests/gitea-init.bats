@@ -26,7 +26,7 @@ exec "$@"
 EOF
   chmod +x "$BATS_TEST_TMPDIR/as-user"
   export ADK_AS_USER_HOOK="$BATS_TEST_TMPDIR/as-user"
-  export ADK_GITEA_LOCK="$BATS_TEST_TMPDIR/gitea-admin.lock"
+  export ADK_GITEA_LOCK_DIR="$BATS_TEST_TMPDIR/run-adk"
 }
 
 # st PYTHON_EXPR: evaluate an expression over the fake Gitea state (variable s)
@@ -315,7 +315,10 @@ json.dump(s, open(p, "w"))' "$FAKE_STATE"
 }
 
 @test "kit scripts with admin access run one at a time (lock), each deletes its own token" {
-  flock "$ADK_GITEA_LOCK" sleep 5 &
+  # (as a kit script leaves it: root-only directory, file 0600)
+  mkdir -m 0700 "$ADK_GITEA_LOCK_DIR"
+  (umask 077; : > "$ADK_GITEA_LOCK_DIR/gitea-admin.lock")
+  flock "$ADK_GITEA_LOCK_DIR/gitea-admin.lock" sleep 5 &
   holder=$!
   sleep 0.5
   ADK_GITEA_LOCK_WAIT=1 run "$INIT" --config "$CFG"
