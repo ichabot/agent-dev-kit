@@ -163,6 +163,14 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 - **Keine langlebigen Secrets in Actions-Secrets der Repos** (jeder Branch-Workflow liest sie). Der TEST-Deploy-Key (PR 3) ist per `command=` auf `deploy.sh` beschränkt und darf nur TEST erreichen.
 - `uses:`-Actions per Commit-SHA festlegen oder auf Gitea spiegeln (`DEFAULT_ACTIONS_URL` zeigt auf GitHub, Tags sind veränderlich).
 
+**Harte Vorgaben aus dem zweiten Review von PR 2b (Vertrauensanker für PROD):**
+- Job-Tokens von Branch-Workflows können Releases und Commit-Status bearbeiten und mit einem `write:package`-Secret Registry-Tags überschreiben. Deshalb darf PROD seine Entscheidung **weder auf Release-Notizen oder Release-Dateien stützen, die CI schreibt, noch auf Registry-Tags**. Ein von CI geschriebener Digest im Release ist kein Vertrauensanker, solange ein Branch-Job dasselbe Release ändern kann.
+- In PR 4 zu bewerten und zu entscheiden (mit Test, dass ein Branch-Job den Anker nicht fälschen kann):
+  - Digest-Datei, die der **Mitarbeiter signiert** (z. B. `ssh-keygen -Y sign` oder cosign mit einem Schlüssel, den nur der Mitarbeiter hat, nie als Actions-Secret); `update.sh` prüft die Signatur gegen einen auf PROD hinterlegten öffentlichen Schlüssel.
+  - Oder: PROD baut das Image selbst aus dem vom Mitarbeiter getaggten Commit (geschützter Tag, Commit-SHA geprüft) statt ein Image aus der Registry zu ziehen.
+- Release-Builds dürfen nicht `FROM` veränderliche Tags der eigenen Registry bauen (Basis-Images nur per Digest oder aus vertrauenswürdigen Quellen), sonst kann ein Branch-Job über ein überschriebenes Basis-Image in das Release gelangen.
+- `protect-repo.sh --status-check` ist nur Komfort (der Status kommt aus CI und kann von Branch-Jobs gesetzt werden), kein Sicherheitsmerkmal; die Freigabe des Mitarbeiters ist die Kontrolle.
+
 **Tasks:** je ein bats-Test zuerst für: Plan-Anzeige, Abbruch ändert nichts, `changing` ohne Versionseingabe abgelehnt, kein Backup → kein Update, Health-Fehler → Rollback, `--rollback` stellt Daten wieder her, `.env` unverändert nach Update, Lint erkennt verbotene Statements.
 
 **Abnahme:** Alle Tests grün; manueller Durchlauf mit Beispiel-App: additive Änderung, ändernde Änderung mit Freigabe, provozierter Fehler mit Rollback.

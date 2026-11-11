@@ -45,6 +45,14 @@ Dieselbe Tabelle sperrt für diese Prozesse die Container des root-Dockers auße
 80/443 (Caddy): Gitea ist nur über Caddy erreichbar, nicht direkt über seine Container-IP.
 Trotzdem gilt: keine Secrets in user_data oder Metadaten.
 
+Die Tabelle bleibt geladen, auch wenn jemand nftables neu lädt: Debians
+`/etc/nftables.conf` beginnt mit `flush ruleset` und würde sie mitlöschen. Deshalb lädt ein
+Drop-in (`/etc/systemd/system/nftables.service.d/50-adk-egress.conf`) sie nach jedem Start
+und Reload von `nftables.service` sofort wieder, und `adk-egress.service` hängt per `PartOf=`
+an `nftables.service` (Stop/Neustart wirken mit). Der CI-Runner läuft nur zusammen mit den
+Regeln (`Requires=`/`BindsTo=adk-egress.service`) und startet nicht, wenn die Tabelle fehlt;
+ein Neustart der Regeln beendet einen laufenden Job (mit Wipe).
+
 `setup.sh` liest und schreibt im Home von `hermes` nur als `hermes` selbst (`runuser`) und
 bricht ab, wenn dort ein Symlink im Pfad liegt (`~/.bashrc`, `~/.config/docker` …). So kann
 der Agent root nicht über einen Symlink auf Dateien wie `/etc/docker/daemon.json` oder
@@ -170,10 +178,18 @@ Caddy setzt HSTS, `nosniff`, `X-Frame-Options DENY`, `Referrer-Policy` und entfe
 `agent-bot` darf keine Repos anlegen, weil Gitea den Ersteller eines Repos zu dessen Admin
 macht – damit könnte der Agent den Branch-Schutz seines Repos abschalten (in der
 Organisation: Team ohne „Repos anlegen“; im eigenen Namensraum: `max_repo_creation 0`, dort
-wäre er Admin mit eigenem Runner, Secrets und Webhooks). Neue Repos legt der Mitarbeiter an;
-`agent-bot` hat über das Team sofort Schreibrechte.
+wäre er Admin mit eigenem Runner, Secrets und Webhooks).
 
-**Jedes Repo wird danach geschützt** (Gitea kennt keinen Organisations-Standard):
+Die Teams `developers` und `readers` gelten **nicht** für alle Repos der Organisation. Ein
+neues Repo ist für `agent-bot` (und `prod-pull`) zunächst unsichtbar; Zugriff bekommen die
+Teams erst durch `protect-repo.sh`, und zwar erst, nachdem der Schutz eingerichtet und
+geprüft ist. Ablauf für jedes neue Repo:
+
+1. Der Mitarbeiter legt das Repo in der Organisation an.
+2. `protect-repo.sh` schützt es (siehe unten) und gibt danach den Teams Zugriff.
+3. Erst jetzt kann der Agent (`agent-bot`) dort Branches pushen und Pull Requests öffnen.
+
+**Schutz und Zugriff** (Gitea kennt keinen Organisations-Standard):
 
 ```bash
 ssh adk-admin@<IP> sudo /opt/adk/agent/protect-repo.sh <CUSTOMER_NAME>/<repo>
@@ -189,12 +205,16 @@ ssh adk-admin@<IP> sudo /opt/adk/agent/protect-repo.sh <CUSTOMER_NAME>/<repo>
 - Tags: Regel `*`, nur `GITEA_ADMIN_USER` darf Tags anlegen oder löschen (Releases/Tags
   von `agent-bot` und CI-Jobs werden abgelehnt). Weitere Tag-Regeln, die mehr Benutzer
   erlauben, meldet das Skript als Fehler.
+- Danach (nur wenn die Prüfung des Schutzes bestanden ist): Teams `developers` und `readers`
+  bekommen Zugriff auf das Repo.
 
 Der Mitarbeiter legt das Repo an und führt das Skript aus bzw. bittet den Einrichter/Admin
 darum (der Skill „Projekt anlegen“ aus PR 5 verweist darauf). `gitea-init.sh` (und damit jeder
-`setup.sh`-Lauf) listet Repos der Organisation ohne diesen Schutz als `WARNING`. `agent-bot`
-kann den Schutz nicht ändern, nicht mergen, keine Tags pushen und keine Organisations- oder
-Repo-Einstellungen ändern (im Integrationstest jeweils abgelehnt).
+`setup.sh`-Lauf) listet Repos der Organisation ohne diesen Schutz als `WARNING` und **nimmt
+dem Team `developers` dort den Zugriff** (z. B. wenn der Schutz später entfernt wurde);
+geschützte Repos ohne Team-Zugriff meldet es ebenfalls. `agent-bot` kann den Schutz nicht
+ändern, nicht mergen, keine Tags pushen und keine Organisations- oder Repo-Einstellungen
+ändern (im Integrationstest jeweils abgelehnt).
 
 Das Token von `agent-bot` (Scopes `write:repository`, `write:issue`, `read:user`,
 `read:organization`, `read:package` – kein `write:package`: Images in der Registry sind das,
@@ -210,8 +230,10 @@ dass es nicht mehr gilt. Hat der Mitarbeiter sein Passwort noch nicht geändert 
 gesetzt oder Startpasswort-Datei noch vorhanden), wird das Kennzeichen „muss Passwort
 ändern“ dafür kurz aufgehoben und am Ende **zuerst** wieder gesetzt – auch wenn der Lauf
 scheitert. Eine Markierungsdatei (`/root/.adk-gitea-must-change-pending`) sorgt dafür, dass
-nach einem abgebrochenen Lauf der nächste das Kennzeichen wieder setzt; übrig gebliebene
-temporäre Tokens (`adk-init-*`) löscht jeder Lauf am Anfang und am Ende.
+nach einem abgebrochenen Lauf der nächste das Kennzeichen wieder setzt. Es läuft immer nur
+eines der beiden Skripte (Sperre `/run/adk-gitea-admin.lock`, ein zweiter Lauf wartet); jeder
+Lauf hat einen eigenen Token-Namen, löscht am Anfang übrig gebliebene `adk-init-*`-Tokens
+abgebrochener Läufe und am Ende sein eigenes.
 
 ### Erste Anmeldung des Mitarbeiters
 
@@ -220,7 +242,8 @@ temporäre Tokens (`adk-init-*`) löscht jeder Lauf am Anfang und am Ende.
 2. Mitarbeiter öffnet `https://GITEA_DOMAIN/`, meldet sich an und muss sofort ein eigenes
    Passwort setzen; danach 2FA einrichten (Einstellungen → Sicherheit).
 3. Mitarbeiter legt das erste Repo in der Organisation an; danach
-   `sudo /opt/adk/agent/protect-repo.sh <CUSTOMER_NAME>/<repo>` (siehe oben).
+   `sudo /opt/adk/agent/protect-repo.sh <CUSTOMER_NAME>/<repo>` (siehe oben) – erst dann hat
+   der Agent Zugriff darauf.
 
 ### CI-Runner
 
@@ -238,20 +261,47 @@ Socket kann ein Job alles, was `ci` kann: andere Container starten, Pfade einbin
   Registrierung nach dem Job.
 - Nach jedem Job (`ExecStopPost`) und vor dem nächsten (`ExecStartPre`) läuft als **root**
   `agent/ci-reset.sh` – ein Schritt der System-Unit, nichts, was `ci` beeinflussen kann:
-  User-Manager von `ci` stoppen (rootless Docker, User-Units, Timer), Sitzungen beenden,
-  alle Prozesse von `ci` und seinen Sub-UIDs beenden, das Home von `ci` löschen (Docker-Daten,
-  Images, Build-Cache, `~/.config/systemd/user`, Caches), ebenso `/var/lib/adk-runner` (mit der
-  Registrierungsdatei) und alle Dateien von `ci`/Sub-UIDs in `/tmp`, `/var/tmp`, `/dev/shm`,
-  `/run`, Cron-Spool usw.; Home und Zustandsverzeichnis leer neu anlegen.
-- Vor dem nächsten Job: rootless Docker für `ci` neu einrichten (Dateien im Home schreibt
-  `ci` selbst), Job-Image per Digest ziehen, neu registrieren: Registrierungstoken frisch aus
+  1. Konto von `ci` abgelaufen setzen (`usermod -L -e 1`) und Linger aus: Cron, `at` und der
+     User-Manager von systemd starten für `ci` nichts mehr. Einträge von `ci` in den Spools
+     von Cron, `at` und Mail löscht root direkt (`find … -delete`, nur in Verzeichnissen, die
+     kein normaler Benutzer ändern kann). `ci` steht außerdem seit dem Setup in
+     `/etc/cron.deny` und `/etc/at.deny`.
+  2. User-Manager stoppen, Sitzungen beenden, dann alle Prozesse beenden: `cgroup.kill` der
+     `user-<uid>.slice` (rootless Docker, Container, User-Units – der Kernel erwischt auch
+     gerade geforkte Prozesse), `kill -KILL -1` als `ci` (alle Prozesse mit dessen uid in einem
+     Durchgang), Reste der Sub-UIDs per PID; danach wird geprüft, dass nichts übrig ist.
+     SysV-IPC-Objekte (Shared Memory, Semaphoren, Message Queues) von `ci`/Sub-UIDs werden
+     per ID entfernt.
+  3. Dateien von `ci`/Sub-UIDs in `/tmp`, `/var/tmp`, `/dev/shm`, `/dev/mqueue`, `/run/lock`
+     löscht **`ci` selbst** in einem eigenen User-Namespace (dort darf es auch Dateien seiner
+     Sub-UIDs löschen), mit `find -delete`: root handelt nie auf Pfadnamen in Verzeichnissen,
+     die `ci` oder `hermes` ändern können. Ein Verzeichnis, das währenddessen gegen einen
+     Symlink getauscht wird, wird höchstens als Link entfernt – und auch dann nur mit den
+     Rechten von `ci` (im Integrationstest mit einem Tausch-Angriff geprüft).
+  4. Home von `ci` (Docker-Daten, Images, Build-Cache, `~/.config/systemd/user`, Caches) und
+     `/var/lib/adk-runner` (mit der Registrierungsdatei) werden erst in ein root-eigenes
+     Verzeichnis (0700) verschoben und dann gelöscht; beide leer neu anlegen. Übrige Dateien
+     von `ci` irgendwo sonst meldet der Schritt als `WARNING` im Journal, ohne sie anzufassen.
+- Vor dem nächsten Job: Konto wieder gültig und Linger an, rootless Docker für `ci` neu
+  einrichten (Dateien im Home schreibt `ci` selbst), Job-Image per Digest ziehen, neu
+  registrieren: Registrierungstoken frisch aus
   der Gitea-CLI (alte Tokens vorher ungültig), per Pipe in die Umgebung des
   `register`-Prozesses (nie argv, Datei oder Ausgabe), danach sofort wieder ungültig.
   Registrierung auf Organisationsebene (`CUSTOMER_NAME`), alte Einträge werden entfernt.
 
 Ein Job kann damit keinen späteren beeinflussen: keine gemeinsamen Images oder Caches, keine
-untergeschobenen Units oder Prozesse, keine wiederverwendbare Registrierung (die Datei ist
-während des Jobs lesbar, gilt aber nur für genau diesen Job). **Preis:** Basis-Images und das
+untergeschobenen Units, Cron-/`at`-Jobs, Prozesse oder IPC-Objekte, keine wiederverwendbare
+Registrierung (die Datei ist während des Jobs lesbar, gilt aber nur für genau diesen Job).
+Nicht gelöscht werden die Kernel-Keyrings von `ci` (`keyctl`); in Job-Containern verbietet
+Dockers Standard-Seccomp-Profil `keyctl`/`add_key`, ein Job kommt also nur über einen
+Umweg (User-Unit auf dem Host) daran, und Schlüssel dort laufen nach einigen Tagen ab.
+
+**Laufzeitgrenze:** Ein Runner-Lauf endet spätestens nach `RuntimeMaxSec=190min` (Job-Timeout
+3 h plus Reserve), auch wenn Job oder Runner hängen; der Wipe läuft dann trotzdem
+(`ExecStopPost`). Die Zeit zählt ab der Registrierung, also inklusive Warten auf einen Job: Ein
+untätiger Runner wird etwa alle 3 Stunden neu aufgesetzt. Ein Job, der kurz vor diesem
+Zeitpunkt startet, kann abgebrochen werden (dann neu starten); Jobs, die Stunden dauern, sind
+nicht vorgesehen. **Preis:** Basis-Images und das
 Job-Image werden für jeden Job neu geladen; Builds dauern entsprechend länger, der erste
 Schritt eines Jobs wartet bis zu einigen Minuten. Zwischen zwei Jobs vergehen etwa 30–90 s
 (abhängig vom Download des Job-Images).
@@ -301,17 +351,23 @@ liegen sie unverschlüsselt (root 0700), off-site nur mit `age` verschlüsselt.
 Täglich um 03:30 schreibt `agent/backup.sh` nach `/var/backups/adk/<UTC-Zeit>/` (root 0700):
 
 - `gitea-dump.tar.gz`: `gitea dump` eines **gestoppten** Gitea. Gitea wird kurz angehalten,
-  ein Einmal-Container desselben Images erzeugt den Dump als Container-User, danach startet
-  Gitea wieder (auch bei Fehlern). So schreibt während des Dumps niemand (keine Pushes des
-  Agenten, keine Jobs); Gitea ist dafür einige Sekunden bis Minuten nicht erreichbar, ein um
-  03:30 laufender Job kann daran scheitern.
+  ein Einmal-Container desselben Images erzeugt den Dump als Container-User (höchstens 2 h,
+  dann wird er beendet und der Teil gilt als fehlgeschlagen), danach startet Gitea wieder –
+  auch bei Fehlern, wenn das Skript abgebrochen wird oder der Server währenddessen
+  herunterfährt (`ExecStopPost=backup.sh --ensure-gitea` startet Gitea, wenn eine
+  Markierungsdatei zeigt, dass das Backup es gestoppt hat). So schreibt während des Dumps
+  niemand (keine Pushes des Agenten, keine Jobs); Gitea ist dafür einige Sekunden bis Minuten
+  nicht erreichbar, ein um 03:30 laufender Job kann daran scheitern.
 - `adk-secrets.tar`: `/opt/adk/secrets` + `kit.env`.
 - `hermes-home.tar.gz`: Home von `hermes`, als `hermes` gepackt und komprimiert, Symlinks
   werden nicht verfolgt; ohne Caches, `node_modules`, rootless-Docker-Daten und die von
   `setup.sh` neu installierbare Hermes-Software.
-- `MANIFEST` (sha256 je Datei, fehlgeschlagene Teile als `FAILED <teil>`) und
-  `MANIFEST.sig`: Signatur mit `ssh-keygen -Y sign` (Schlüssel `/root/.ssh/adk-backup-sign`,
-  Namespace `adk-backup`).
+- `MANIFEST`: erste Zeile `backup <UTC-Zeit> adk-<CUSTOMER_NAME>-agent` (Zeitpunkt und
+  Server), dann sha256 je Datei – mit `BACKUP_TARGET` auch der `age`-verschlüsselten Kopien –,
+  fehlgeschlagene Teile als `FAILED <teil>`; `MANIFEST.sig`: Signatur mit `ssh-keygen -Y sign`
+  (Schlüssel `/root/.ssh/adk-backup-sign`, Namespace `adk-backup`). Der öffentliche Teil
+  (`.pub`, `/etc/adk/backup-allowed-signers`) wird bei jedem `setup.sh`-Lauf aus dem privaten
+  Schlüssel neu abgeleitet.
 
 Vor dem Start prüft das Skript den freien Platz (Gitea-Daten + Secrets + gesichertes Home,
 unkomprimiert, plus 10 % und 512 MB); reicht er nicht, endet es ohne Backup mit Fehler.
@@ -333,9 +389,15 @@ sudo /opt/adk/agent/restore.sh --yes /var/backups/adk/<Zeit>
 sudo /opt/adk/agent/restore.sh --gitea --hermes-home --yes /var/backups/adk/<Zeit>
 ```
 
-`restore.sh` prüft vor jeder Änderung: Signatur von `MANIFEST` (Standard-Schlüssel
-`/etc/adk/backup-allowed-signers`, sonst `--signer <öffentlicher Schlüssel>`), sha256 jeder
-gewählten Datei, keine als fehlgeschlagen markierten Teile, und dass `gitea-dump.tar.gz` und
+`restore.sh` kopiert ein Backup-Verzeichnis, das ein normaler Benutzer ändern könnte
+(Eigentümer, Schreibrechte des Verzeichnisses, seiner Dateien oder eines übergeordneten
+Verzeichnisses), zuerst in ein root-eigenes temporäres Verzeichnis und prüft und benutzt nur
+die Kopie. Es prüft vor jeder Änderung: Signatur von `MANIFEST` (Standard-Schlüssel
+`/etc/adk/backup-allowed-signers`, sonst `--signer <öffentlicher Schlüssel>`); die signierte
+Kopfzeile passt zum Verzeichnisnamen (ein älteres Backup unter dem Namen eines neueren wird
+abgelehnt) und zu diesem Server (`CUSTOMER_NAME` aus `kit.env`), das Alter des Backups wird
+angezeigt; sha256 jeder gewählten Datei, bei `*.age` zuerst die des Chiffrats (vor dem
+Entschlüsseln); keine als fehlgeschlagen markierten Teile, und dass `gitea-dump.tar.gz` und
 `adk-secrets.tar` nur normale Dateien und Verzeichnisse an erwarteten Pfaden enthalten (keine
 Symlinks, Hardlinks, Geräte, `..`, absolute Pfade) – ein manipulierter Dump kann root so
 nicht an andere Stellen schreiben lassen. Ohne `--yes` prüft es nur. Nach dem Gitea-Restore
@@ -362,9 +424,11 @@ in `kit.env`, der private Schlüssel bleibt offline beim Kunden, nie auf dem Ser
 3. Den Signatur-Public-Key (`/root/.ssh/adk-backup-sign.pub`, zeigt `setup.sh` beim Anlegen)
    zusammen mit dem `age`-Schlüssel offline aufbewahren.
 
-`backup.sh` verschlüsselt danach jede Datei mit `age` an `BACKUP_AGE_RECIPIENT` und kopiert
+`backup.sh` verschlüsselt danach jede Datei mit `age` an `BACKUP_AGE_RECIPIENT` (vor dem
+Signieren, damit das `MANIFEST` auch die Prüfsummen der `*.age`-Dateien enthält) und kopiert
 `*.age`, `MANIFEST` und `MANIFEST.sig` per `rsync` über SSH nach `<pfad>/<Zeit>/`; unverschlüsselt
-verlässt nichts den Server. Restore aus der Off-Site-Kopie: Verzeichnis zurückkopieren und
+verlässt nichts den Server. Wer das Ziel kontrolliert, kann ein Backup löschen oder ein älteres
+liefern, aber nicht unbemerkt umbenennen oder verändern. Restore aus der Off-Site-Kopie: Verzeichnis zurückkopieren und
 `restore.sh --age-identity <age-Schlüssel> --signer <Signatur-Public-Key> …` (entschlüsselt in
 ein root-eigenes temporäres Verzeichnis) – oder auf dem eigenen Rechner mit
 `age -d -i kunde-backup.key` entschlüsseln und das Verzeichnis hochladen. Die Aufbewahrung am
