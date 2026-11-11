@@ -40,6 +40,19 @@ api_try() {
   API_CODE="${out##*$'\n'}"
   API_BODY="${out%$'\n'*}"
 }
+# api_conf METHOD PATH < curl-config: like api, but the JSON body comes as curl config lines on
+# stdin (data = "..."), sent together with the token header: for request bodies that are
+# secrets (an Actions secret), nothing of them ever appears in an argv
+api_conf() {
+  local method="$1" path="$2" out
+  API_CODE="" API_BODY=""
+  out="$({ printf 'header = "Authorization: token %s"\n' "$TOKEN"; cat; } \
+    | gx curl -q -sS -K - -X "$method" -H 'Content-Type: application/json' -w '\n%{http_code}' "http://127.0.0.1:3000/api/v1$path")" \
+    || adk_die "API call $path failed"
+  API_CODE="${out##*$'\n'}"
+  API_BODY="${out%$'\n'*}"
+}
+
 # api [--token T] METHOD PATH [JSON]: like api_try, a failed call ends the script
 api() {
   api_try "$@" || adk_die "API call ${*: -2:1} failed"
