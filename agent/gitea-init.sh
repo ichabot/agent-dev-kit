@@ -9,17 +9,20 @@
 #   GITEA_ADMIN_USER  site admin (the customer's employee); random initial password ONLY in
 #                     /root/adk-gitea-initial-password (0600), must be changed at first login
 #   agent-bot         bot account (no password, cannot log in to the web UI), member of team
-#                     "developers" of the organization: write on all repositories, no admin,
-#                     cannot create repositories (Gitea makes a repository's creator its admin,
-#                     which would let agent-bot change branch protection)
+#                     "developers" of the organization: write code, issues, pull requests and
+#                     wiki, only READ releases, packages and actions; cannot create repositories
+#                     (in the organization Gitea would make it the repository's admin, which
+#                     could change branch protection; in its own namespace: max_repo_creation 0)
 #   prod-pull         bot account in team "readers" (read code, releases, packages); its
-#                     token is created per PROD server later
+#                     token is created per PROD server later; max_repo_creation 0
 #   CUSTOMER_NAME     private organization, owned by GITEA_ADMIN_USER
 #   hermes            ~/.config/gitea/token (agent-bot token, 0600) and a git credential
 #                     helper for https://GITEA_DOMAIN, written AS hermes (lib/user-file.sh)
+# Organization repositories without the protection of protect-repo.sh are listed as WARNING.
 #
 # API calls run inside the Gitea container against 127.0.0.1:3000 with a temporary token of
-# the admin user, passed on stdin (never in argv) and deleted again at the end.
+# the admin user, passed on stdin (never in argv) and deleted again at the end
+# (lib/gitea-admin.sh).
 # Tests: as non-root with ADK_AS_USER_HOOK set, ADK_TEST_HERMES_HOME and
 # ADK_TEST_PASSWORD_FILE replace the real paths (ignored as root).
 # Exit codes: 0 = done, 1 = failure, 2 = usage, 3 = refused file operation in hermes's home.
@@ -30,15 +33,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck source-path=SCRIPTDIR source=lib/host.sh
 source "$HERE/lib/host.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/gitea-admin.sh
+source "$HERE/lib/gitea-admin.sh"
 # shellcheck source-path=SCRIPTDIR source=../scripts/lib/config.sh
 source "$ROOT/scripts/lib/config.sh"
 
 AGENT_USER=hermes
 BOT=agent-bot
 PULL=prod-pull
-BOT_SCOPES="write:repository,write:issue,read:user,write:package,read:organization"
-COMPOSE_FILE=/opt/adk/services/compose.yaml
-PASSWORD_FILE=/root/adk-gitea-initial-password
+# No write:package: PROD pulls images from the registry, agent-bot must not publish them.
+BOT_SCOPES="write:repository,write:issue,read:user,read:organization,read:package"
+ADMIN_SCOPES="write:organization,write:admin,read:repository,read:user"
 
 usage() { echo "usage: $0 [--config FILE]" >&2; exit 2; }
 
@@ -53,12 +58,13 @@ done
 if [[ "$(id -u)" -ne 0 ]]; then
   [[ -n "${ADK_AS_USER_HOOK:-}" && -n "${ADK_TEST_HERMES_HOME:-}" && -n "${ADK_TEST_PASSWORD_FILE:-}" ]] \
     || { echo "ERROR: run as root (sudo $0)" >&2; exit 2; }
-  PASSWORD_FILE="$ADK_TEST_PASSWORD_FILE"
+  ADK_GITEA_PASSWORD_FILE="$ADK_TEST_PASSWORD_FILE"
   AGENT_HOME="$ADK_TEST_HERMES_HOME"
 else
   AGENT_HOME="$(adk_user_home "$AGENT_USER")"
   [[ -n "$AGENT_HOME" ]] || adk_die "user $AGENT_USER does not exist (run setup.sh first)"
 fi
+PASSWORD_FILE="$ADK_GITEA_PASSWORD_FILE"
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: config file not found: $CONFIG" >&2; exit 2; }
 if ! check_out="$("$ROOT/scripts/check-config.sh" "$CONFIG")"; then
@@ -71,29 +77,6 @@ ADMIN="${CFG[GITEA_ADMIN_USER]}"
 ADMIN_EMAIL="${CFG[GITEA_ADMIN_EMAIL]}"
 DOMAIN="${CFG[GITEA_DOMAIN]}"
 
-# --- Gitea access (inside the container, as its user git) -------------------------------
-gx() { docker compose -f "$COMPOSE_FILE" exec -T -u git gitea "$@"; }
-gitea_cli() { gx gitea "$@"; }
-# Names in SQL are checked against ^[a-z0-9._-]+$ by check-config.sh / constants above.
-sql() { gx sqlite3 /data/gitea/gitea.db "$1" < /dev/null; }
-
-TOKEN=""        # temporary admin token (memory only)
-API_BODY="" API_CODE=""
-# api [--token T] METHOD PATH [JSON]: sets API_BODY and API_CODE; the token goes via stdin
-api() {
-  local token="$TOKEN" out
-  if [[ "$1" == --token ]]; then token="$2"; shift 2; fi
-  local method="$1" path="$2" data=()
-  (($# >= 3)) && data=(-H 'Content-Type: application/json' --data-binary "$3")
-  out="$(printf 'Authorization: token %s\n' "$token" \
-    | gx curl -q -sS -X "$method" -H @- "${data[@]}" -w '\n%{http_code}' "http://127.0.0.1:3000/api/v1$path")" \
-    || adk_die "API call $method $path failed"
-  API_CODE="${out##*$'\n'}"
-  API_BODY="${out%$'\n'*}"
-}
-# json EXPR: evaluate a Python expression over API_BODY (variable d)
-json() { python3 -I -c 'import json, sys; d = json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$API_BODY" "$1"; }
-
 # user_row NAME: "<is_admin> <type>" from `gitea admin user list`, empty if missing
 user_row() {
   gitea_cli admin user list < /dev/null | awk -v u="$1" 'NR > 1 && tolower($2) == tolower(u) {print $5, $7}'
@@ -101,7 +84,6 @@ user_row() {
 
 # --- accounts ---------------------------------------------------------------------------
 echo "== gitea accounts"
-SET_MUST_CHANGE=false
 row="$(user_row "$ADMIN")"
 if [[ -z "$row" ]]; then
   # Gitea prints the random password once; it goes only into the root-owned file.
@@ -119,7 +101,6 @@ if [[ -z "$row" ]]; then
     mv -f "$PASSWORD_FILE.tmp" "$PASSWORD_FILE"
   )
   pw=""
-  SET_MUST_CHANGE=true
   adk_changed "gitea user $ADMIN (site admin), initial password in $PASSWORD_FILE"
 else
   [[ "${row%% *}" == true ]] || adk_die "Gitea user $ADMIN exists but is not a site admin"
@@ -139,37 +120,10 @@ for bot in "$BOT" "$PULL"; do
 done
 
 # --- temporary admin token -------------------------------------------------------------
-# The API refuses users that must change their password: lift the flag for this run and put
-# it back at the end (the password stays unknown to everybody but the employee / root).
-TMP_TOKEN_NAME="adk-init-$(date -u +%Y%m%d%H%M%S)-$$"
-mc="$(sql "SELECT must_change_password FROM \"user\" WHERE lower_name = '${ADMIN,,}';")"
-[[ "$mc" == 1 ]] && SET_MUST_CHANGE=true
-
-cleanup() {
-  local rc=$?
-  trap - EXIT
-  if [[ -n "$TOKEN" ]]; then
-    sql "DELETE FROM access_token WHERE name = '$TMP_TOKEN_NAME';" || echo "ERROR: could not delete the temporary token $TMP_TOKEN_NAME" >&2
-    api GET /user
-    if [[ "$API_CODE" != 401 ]]; then
-      echo "ERROR: temporary admin token $TMP_TOKEN_NAME still works (HTTP $API_CODE); delete it in the Gitea UI" >&2
-      rc=1
-    fi
-    TOKEN=""
-  fi
-  if [[ "$SET_MUST_CHANGE" == true ]]; then
-    gitea_cli admin user must-change-password "$ADMIN" < /dev/null > /dev/null \
-      || { echo "ERROR: could not set must-change-password for $ADMIN" >&2; rc=1; }
-  fi
-  exit "$rc"
-}
-trap cleanup EXIT
-if [[ "$SET_MUST_CHANGE" == true ]]; then
-  gitea_cli admin user must-change-password --unset "$ADMIN" < /dev/null > /dev/null
-fi
-TOKEN="$(gitea_cli admin user generate-access-token --username "$ADMIN" --token-name "$TMP_TOKEN_NAME" \
-  --scopes "write:organization,read:user" --raw < /dev/null | tail -n 1)"
-[[ "$TOKEN" =~ ^[0-9a-f]{40}$ ]] || { TOKEN=""; adk_die "could not create a temporary admin token"; }
+# lib/gitea-admin.sh: the must-change flag is lifted for this run and set again at the end
+# (also after errors, and by the next run if this one is killed).
+trap 'adk_gitea_admin_end || exit 1' EXIT
+adk_gitea_admin_begin "$ADMIN" "$ADMIN_SCOPES"
 
 # --- organization and teams -------------------------------------------------------------
 echo "== gitea organization $ORG"
@@ -184,7 +138,8 @@ case "$API_CODE" in
   *) adk_die "GET /orgs/$ORG: HTTP $API_CODE" ;;
 esac
 
-DEV_UNITS='{"repo.code":"write","repo.issues":"write","repo.pulls":"write","repo.releases":"write","repo.wiki":"write","repo.projects":"write","repo.packages":"write","repo.actions":"write","repo.ext_issues":"read","repo.ext_wiki":"read"}'
+# Releases, packages and actions only readable: tags/releases and images are the employee's.
+DEV_UNITS='{"repo.code":"write","repo.issues":"write","repo.pulls":"write","repo.wiki":"write","repo.projects":"write","repo.releases":"read","repo.packages":"read","repo.actions":"read","repo.ext_issues":"read","repo.ext_wiki":"read"}'
 READ_UNITS='{"repo.code":"read","repo.releases":"read","repo.packages":"read"}'
 
 # ensure_team NAME PERMISSION UNITS_JSON DESCRIPTION: prints the team id
@@ -247,6 +202,44 @@ for bot in "$BOT" "$PULL"; do
 done
 adk_ok "$BOT and $PULL are not owners of $ORG"
 
+# Repositories in their own namespace would make a bot their admin (runners, secrets,
+# webhooks there): neither bot may create any.
+for bot in "$BOT" "$PULL"; do
+  limit="$(sql "SELECT max_repo_creation FROM \"user\" WHERE lower_name = '$bot';")"
+  if [[ "$limit" == 0 ]]; then
+    adk_ok "$bot cannot create repositories (max_repo_creation 0)"
+  else
+    api PATCH "/admin/users/$bot" "{\"source_id\":0,\"login_name\":\"$bot\",\"max_repo_creation\":0}"
+    [[ "$API_CODE" == 200 ]] || adk_die "cannot set max_repo_creation of $bot (HTTP $API_CODE): $API_BODY"
+    adk_changed "$bot cannot create repositories (max_repo_creation 0)"
+  fi
+done
+
+# --- repository protection (set by protect-repo.sh; only reported here) -------------------
+echo "== repository protection"
+repos=()
+for ((page = 1; ; page++)); do
+  api GET "/orgs/$ORG/repos?limit=50&page=$page"
+  [[ "$API_CODE" == 200 ]] || adk_die "GET /orgs/$ORG/repos: HTTP $API_CODE"
+  [[ "$(json 'len(d)')" != 0 ]] || break
+  mapfile -t -O "${#repos[@]}" repos < <(json '"\n".join(r["full_name"] for r in d)')
+  [[ "$(json 'len(d)')" == 50 ]] || break
+done
+unprotected=0
+for repo in "${repos[@]}"; do
+  [[ -n "$repo" ]] || continue
+  problems="$(adk_protection_problems "$repo" "$ADMIN")"
+  if [[ -z "$problems" ]]; then
+    adk_ok "$repo protected (default branch, tags)"
+  else
+    unprotected=$((unprotected + 1))
+    echo "WARNING: $repo is not protected as required:"
+    while IFS= read -r line; do echo "  - $line"; done <<< "$problems"
+    echo "  fix: sudo /opt/adk/agent/protect-repo.sh $repo"
+  fi
+done
+((unprotected == 0)) || echo "WARNING: $unprotected repositor(y/ies) of $ORG without protection: agent-bot could merge or tag there"
+
 # --- agent-bot token for hermes ----------------------------------------------------------
 echo "== agent-bot token for $AGENT_USER"
 token_file="$AGENT_HOME/.config/gitea/token"
@@ -258,6 +251,16 @@ if adk_user_test "$AGENT_USER" "$AGENT_HOME" -f "$token_file"; then
     [[ "$API_CODE" == 200 && "$(json 'd["login"]')" == "$BOT" ]] && have_valid=true
   fi
   current=""
+  # Every hermes-* token of agent-bot must have exactly BOT_SCOPES (older kits granted more).
+  scopes="$(sql "SELECT scope FROM access_token WHERE uid = (SELECT id FROM \"user\" WHERE lower_name = '$BOT') AND name LIKE 'hermes-%';")"
+  if [[ "$have_valid" == true ]] && ! python3 -I -c '
+import sys
+want = set(sys.argv[1].split(","))
+rows = [r for r in sys.argv[2].splitlines() if r.strip()]
+sys.exit(0 if rows and all(set(r.strip().split(",")) == want for r in rows) else 1)' "$BOT_SCOPES" "$scopes"; then
+    have_valid=false
+    echo "agent-bot token has other scopes than $BOT_SCOPES: replacing it"
+  fi
 fi
 if [[ "$have_valid" == true ]]; then
   adk_ok "$token_file (valid $BOT token)"

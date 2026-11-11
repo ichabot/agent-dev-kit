@@ -78,6 +78,9 @@ refute() {
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "developers"]')" = "[['agent-bot']]" ]
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "readers"]')" = "[['prod-pull']]" ]
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "Owners"]')" = "[['anna.mueller']]" ]
+  # developers: write code, issues, pulls, wiki; only read packages, releases and actions
+  [ "$(st '[t["units_map"] for t in s["teams"].values() if t["name"] == "developers"]')" \
+    = "[{'repo.code': 'write', 'repo.issues': 'write', 'repo.pulls': 'write', 'repo.wiki': 'write', 'repo.projects': 'write', 'repo.releases': 'read', 'repo.packages': 'read', 'repo.actions': 'read', 'repo.ext_issues': 'read', 'repo.ext_wiki': 'read'}]" ]
   # readers: read-only units incl. packages
   [ "$(st '[t["units_map"] for t in s["teams"].values() if t["name"] == "readers"]')" \
     = "[{'repo.code': 'read', 'repo.releases': 'read', 'repo.packages': 'read'}]" ]
@@ -103,8 +106,9 @@ refute() {
   [ "$(stat -c %a "$HERMES_HOME/.config/gitea/token")" = "600" ]
   [ "$(stat -c %a "$HERMES_HOME/.config/gitea")" = "700" ]
   [ "$(st "[t['user'] for t in s['tokens'] if t['token'] == '$tok']")" = "['agent-bot']" ]
+  # no package write (PROD pulls images; agent-bot must not publish them), no admin scopes
   [ "$(st "[t['scopes'] for t in s['tokens'] if t['token'] == '$tok']")" \
-    = "['write:repository,write:issue,read:user,write:package,read:organization']" ]
+    = "['write:repository,write:issue,read:user,read:organization,read:package']" ]
   [[ "$output" != *"$tok"* ]]
   refute grep -qF "$tok" "$FAKE_LOG"
   # no token for prod-pull yet
@@ -140,6 +144,7 @@ refute() {
 
 @test "employee who already changed the password keeps must_change off" {
   "$INIT" --config "$CFG" > /dev/null
+  rm "$ADK_TEST_PASSWORD_FILE"   # handed over
   python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p)); s["users"]["anna.mueller"]["must_change"] = False; json.dump(s, open(p, "w"))' "$FAKE_STATE"
   run "$INIT" --config "$CFG"
   [ "$status" -eq 0 ]
@@ -198,4 +203,80 @@ json.dump(s, open(p, "w"))' "$FAKE_STATE"
   run "$INIT" --config "$CFG"
   [ "$status" -eq 3 ]
   [ -z "$(ls -A "$BATS_TEST_TMPDIR/elsewhere")" ]
+}
+
+@test "both bots may not create repositories in their own namespace (max_repo_creation 0)" {
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [ "$(st 's["users"]["agent-bot"]["max_repo_creation"]')" = "0" ]
+  [ "$(st 's["users"]["prod-pull"]["max_repo_creation"]')" = "0" ]
+  [ "$(st 's["users"]["anna.mueller"]["max_repo_creation"]')" = "-1" ]
+  : > "$FAKE_LOG"
+  run "$INIT" --config "$CFG"
+  refute grep -q 'API PATCH /admin/users' "$FAKE_LOG"
+}
+
+@test "a leftover temporary token of a killed run is deleted at the start" {
+  "$INIT" --config "$CFG" > /dev/null
+  docker compose -f x exec -T -u git gitea gitea admin user generate-access-token --username anna.mueller \
+    --token-name adk-init-20260101000000-1 --scopes all --raw > /dev/null
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [ "$(st '[t["name"] for t in s["tokens"] if t["user"] == "anna.mueller"]')" = "[]" ]
+}
+
+@test "Gitea failing during the run: must-change is set again, the token deleted, exit != 0" {
+  "$INIT" --config "$CFG" > /dev/null
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p)); s["api_calls"] = 0; json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  FAKE_CURL_FAIL_AFTER=2 run "$INIT" --config "$CFG"
+  [ "$status" -ne 0 ]
+  [ "$(st 's["users"]["anna.mueller"]["must_change"]')" = "True" ]
+  [ "$(st '[t["name"] for t in s["tokens"] if t["user"] == "anna.mueller"]')" = "[]" ]
+  [ ! -e "$BATS_TEST_TMPDIR/root/.adk-gitea-must-change-pending" ]
+}
+
+@test "the marker of a crashed run puts must-change back" {
+  "$INIT" --config "$CFG" > /dev/null
+  rm "$ADK_TEST_PASSWORD_FILE"
+  # a run killed after lifting the flag: flag off, marker left behind
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p)); s["users"]["anna.mueller"]["must_change"] = False; json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  : > "$BATS_TEST_TMPDIR/root/.adk-gitea-must-change-pending"
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [ "$(st 's["users"]["anna.mueller"]["must_change"]')" = "True" ]
+  [ ! -e "$BATS_TEST_TMPDIR/root/.adk-gitea-must-change-pending" ]
+}
+
+@test "an initial password file not handed over yet means must change" {
+  "$INIT" --config "$CFG" > /dev/null
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p)); s["users"]["anna.mueller"]["must_change"] = False; json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [ "$(st 's["users"]["anna.mueller"]["must_change"]')" = "True" ]
+}
+
+@test "organization repositories without protection are listed as WARNING" {
+  "$INIT" --config "$CFG" > /dev/null
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p))
+s["repos"]["acme/open"] = {"default_branch": "main", "branch_protections": [], "tag_protections": []}
+json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING: acme/open is not protected"* ]]
+  [[ "$output" == *"protect-repo.sh acme/open"* ]]
+}
+
+@test "a valid agent-bot token with outdated scopes (write:package) is replaced" {
+  "$INIT" --config "$CFG" > /dev/null
+  python3 -I -c 'import json, sys; p = sys.argv[1]; s = json.load(open(p))
+for t in s["tokens"]:
+    if t["user"] == "agent-bot": t["scopes"] = "write:repository,write:issue,read:user,write:package,read:organization"
+json.dump(s, open(p, "w"))' "$FAKE_STATE"
+  old="$(cat "$HERMES_HOME/.config/gitea/token")"
+  sleep 1
+  run "$INIT" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$HERMES_HOME/.config/gitea/token")" != "$old" ]
+  [ "$(st '[t["scopes"] for t in s["tokens"] if t["user"] == "agent-bot"]')" \
+    = "['write:repository,write:issue,read:user,read:organization,read:package']" ]
 }

@@ -2,8 +2,9 @@
 """Fake docker for tests/gitea-init.bats: emulates `docker compose ... exec -T -u git gitea CMD`
 for the Gitea CLI, sqlite3 and curl calls of agent/gitea-init.sh. Never touches the network.
 
-Env: FAKE_STATE (JSON file with users, tokens, orgs, teams), FAKE_LOG (one line per call,
-secrets masked as <token>). Setup the state with tests/fixtures/fake-docker init.
+Env: FAKE_STATE (JSON file with users, tokens, orgs, teams, repos), FAKE_LOG (one line per
+call, secrets masked as <token>), FAKE_CURL_FAIL_AFTER=N (API calls after the N-th fail like
+an unreachable Gitea). Setup the state with tests/fixtures/fake-docker init.
 """
 import json
 import os
@@ -31,7 +32,7 @@ def log(line):
 
 args = sys.argv[1:]
 if args == ["init"]:
-    save({"users": {}, "tokens": [], "orgs": {}, "teams": {}, "next_id": 1})
+    save({"users": {}, "tokens": [], "orgs": {}, "teams": {}, "repos": {}, "next_id": 1, "api_calls": 0})
     sys.exit(0)
 
 # docker compose -f F exec -T -u git gitea CMD...
@@ -75,7 +76,7 @@ if cmd[:3] == ["gitea", "admin", "user"]:
             sys.exit(1)
         utype = flag("--user-type", "individual")
         u = {"id": new_id(), "email": flag("--email"), "admin": "--admin" in cmd,
-             "type": utype, "must_change": False, "password": None}
+             "type": utype, "must_change": False, "password": None, "max_repo_creation": -1}
         if "--random-password" in cmd:
             u["password"] = "Pw-" + secrets.token_hex(8)
             print(f"generated random password is '{u['password']}'")
@@ -128,9 +129,20 @@ if cmd[0] == "sqlite3":
         u = next((u for n, u in s["users"].items() if n.lower() == m.group(1)), None)
         print(u["id"] if u else "")
         sys.exit(0)
-    m = re.match(r"DELETE FROM access_token WHERE name = '([^']+)';", q)
+    m = re.match(r"SELECT max_repo_creation FROM \"user\" WHERE lower_name = '([^']+)';", q)
     if m:
-        s["tokens"] = [t for t in s["tokens"] if t["name"] != m.group(1)]
+        u = next((u for n, u in s["users"].items() if n.lower() == m.group(1)), None)
+        print(u.get("max_repo_creation", -1) if u else "")
+        sys.exit(0)
+    m = re.match(r"SELECT scope FROM access_token WHERE uid = \(SELECT id FROM \"user\" WHERE lower_name = '([^']+)'\) AND name LIKE 'hermes-%';", q)
+    if m:
+        for t in s["tokens"]:
+            if t["user"].lower() == m.group(1) and t["name"].startswith("hermes-"):
+                print(t["scopes"])
+        sys.exit(0)
+    m = re.match(r"DELETE FROM access_token WHERE name LIKE 'adk-init-%';", q)
+    if m:
+        s["tokens"] = [t for t in s["tokens"] if not (t["name"] or "").startswith("adk-init-")]
         save(s)
         sys.exit(0)
     m = re.match(r"DELETE FROM access_token WHERE uid = (\d+) AND name LIKE 'hermes-%' AND name <> '([^']+)';", q)
@@ -164,6 +176,12 @@ if cmd[0] == "curl":
         j += 1
     path = url.split("/api/v1", 1)[1].split("?")[0]
     log(f"API {method} {path} {json.dumps(data) if data is not None else ''}".rstrip())
+    s["api_calls"] = s.get("api_calls", 0) + 1
+    save(s)
+    fail_after = os.environ.get("FAKE_CURL_FAIL_AFTER")
+    if fail_after is not None and s["api_calls"] > int(fail_after):
+        print("curl: (7) Failed to connect to 127.0.0.1 port 3000", file=sys.stderr)
+        sys.exit(7)
 
     def reply(code, body=None):
         print(json.dumps(body if body is not None else {}))
@@ -180,6 +198,54 @@ if cmd[0] == "curl":
         reply(403, {"message": "You must change your password."})
     if method == "GET" and path == "/user":
         reply(200, {"login": doer})
+    m = re.fullmatch(r"/admin/users/([^/]+)", path)
+    if m and method == "PATCH":
+        if not s["users"][doer]["admin"] or "write:admin" not in (tok["scopes"] or ""):
+            reply(403, {"message": "admin scope needed"})
+        if data.get("login_name") != m.group(1) or "source_id" not in data:
+            reply(422, {"message": "login_name and source_id are required"})
+        s["users"][m.group(1)]["max_repo_creation"] = data["max_repo_creation"]
+        reply(200, {"login": m.group(1)})
+    m = re.fullmatch(r"/orgs/([^/]+)/repos", path)
+    if m and method == "GET":
+        reply(200, [{"full_name": k, "default_branch": r["default_branch"]}
+                    for k, r in s["repos"].items() if k.split("/")[0] == m.group(1)])
+    m = re.fullmatch(r"/repos/([^/]+/[^/]+)(/.*)?", path)
+    if m:
+        repo = s["repos"].get(m.group(1))
+        sub = m.group(2) or ""
+        if repo is None:
+            reply(404, {"message": "repo not found"})
+        if not s["users"][doer]["admin"]:
+            reply(403, {"message": "fake: only admins manage repositories here"})
+        if sub == "" and method == "GET":
+            reply(200, {"full_name": m.group(1), "default_branch": repo["default_branch"]})
+        if sub == "/branch_protections" and method == "GET":
+            reply(200, repo["branch_protections"])
+        if sub == "/branch_protections" and method == "POST":
+            repo["branch_protections"].append(dict(data))
+            reply(201, data)
+        mb = re.fullmatch(r"/branch_protections/([^/]+)", sub)
+        if mb:
+            rule = next((r for r in repo["branch_protections"] if r["rule_name"] == mb.group(1)), None)
+            if rule is None:
+                reply(404)
+            if method == "GET":
+                reply(200, rule)
+            if method == "PATCH":
+                rule.update(data)
+                reply(200, rule)
+        if sub == "/tags/protections" and method == "GET":
+            reply(200, repo["tag_protections"])
+        if sub == "/tags/protections" and method == "POST":
+            t = dict(data, id=new_id())
+            repo["tag_protections"].append(t)
+            reply(201, t)
+        mt = re.fullmatch(r"/tags/protections/(\d+)", sub)
+        if mt and method == "PATCH":
+            t = next(t for t in repo["tag_protections"] if t["id"] == int(mt.group(1)))
+            t.update(data)
+            reply(200, t)
     m = re.fullmatch(r"/orgs/([^/]+)", path)
     if m and method == "GET":
         o = s["orgs"].get(m.group(1))
