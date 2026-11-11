@@ -53,6 +53,7 @@ ADK_CI_SCAN_DIRS=(/ /tmp /var/tmp /dev/shm /run)
 ADK_CI_SCAN_PRUNE=(/proc /sys /dev/pts /home /root /opt/adk /var/lib/adk /var/backups /var/lib/docker /var/lib/containerd)
 ADK_CGROUP_ROOT="${ADK_CGROUP_ROOT:-/sys/fs/cgroup}"
 ADK_SYSVIPC_DIR="${ADK_SYSVIPC_DIR:-/proc/sysvipc}"
+ADK_RUN_USER_DIR="${ADK_RUN_USER_DIR:-/run/user}"
 
 # _adk_pids_in_ranges RANGES...: pids whose real or effective uid lies in one of the ranges
 _adk_pids_in_ranges() {
@@ -83,6 +84,31 @@ _adk_cgroup_kill() {
   echo 1 > "$1/cgroup.kill" 2> /dev/null || true
 }
 
+# _adk_user_cgroups_kill UID: cgroup.kill of everything below user-UID.slice (user manager with
+# rootless Docker and containers, session scopes) except user-runtime-dir@UID.service: that is
+# root's own helper that unmounts /run/user/UID, it must finish its stop
+_adk_user_cgroups_kill() {
+  local cg
+  for cg in "$ADK_CGROUP_ROOT/user.slice/user-$1.slice"/*/; do
+    [[ -d "$cg" && "$(basename "$cg")" != user-runtime-dir@* ]] || continue
+    _adk_cgroup_kill "${cg%/}"
+  done
+}
+
+# _adk_runtime_dir_gone UID: /run/user/UID (a tmpfs of the user, with whatever a job put there)
+# is unmounted and removed: stop user-runtime-dir@UID, and if it still exists unmount it and
+# remove it (its parent /run/user belongs to root, nobody else can swap the path)
+_adk_runtime_dir_gone() {
+  local uid="$1" dir="$ADK_RUN_USER_DIR/$1"
+  systemctl reset-failed "user-runtime-dir@$uid.service" > /dev/null 2>&1 || true
+  systemctl stop "user-runtime-dir@$uid.service" > /dev/null 2>&1 || true
+  [[ -e "$dir" || -L "$dir" ]] || return 0
+  adk_dir_chain_trusted "$ADK_RUN_USER_DIR" || adk_die "$ADK_RUN_USER_DIR (or a parent) can be changed by an unprivileged user"
+  if mountpoint -q "$dir"; then umount --lazy "$dir" || adk_die "cannot unmount $dir"; fi
+  rm -rf --one-file-system -- "$dir"
+  [[ ! -e "$dir" ]] || adk_die "cannot remove $dir"
+}
+
 # adk_ci_lock USER: from now on nothing of USER starts again by itself: account expired (cron,
 # at and systemd's user manager check it through PAM and refuse), password locked, no linger
 adk_ci_lock() {
@@ -108,10 +134,10 @@ adk_ci_kill() {
   loginctl terminate-user "$user" > /dev/null 2>&1 || true
   # shellcheck disable=SC2086  # one range per word
   for ((i = 0; i < 20; i++)); do
-    # everything under the user's slice (user manager, rootless Docker, containers) at once,
+    # everything under the user's slice (user manager, rootless Docker, containers) at once
     # then every process with USER's uid anywhere (kill -1 as USER: the kernel walks all
     # processes in one pass), then the subuid processes outside the slice by pid
-    _adk_cgroup_kill "$ADK_CGROUP_ROOT/user.slice/user-$uid.slice"
+    _adk_user_cgroups_kill "$uid"
     _adk_as_uid "$user" kill -s KILL -- -1 > /dev/null 2>&1 || true
     pids="$(_adk_pids_in_ranges $ranges)"
     [[ -n "$pids" ]] || break
@@ -119,7 +145,7 @@ adk_ci_kill() {
     kill -KILL $pids 2> /dev/null || true
     sleep 0.5
   done
-  systemctl stop "user-runtime-dir@$uid.service" > /dev/null 2>&1 || true
+  _adk_runtime_dir_gone "$uid"
   # shellcheck disable=SC2086  # one range per word
   [[ -z "$(_adk_pids_in_ranges $ranges)" ]] || { echo "ERROR: processes of $user survive: $(_adk_pids_in_ranges $ranges | tr '\n' ' ')" >&2; return 1; }
 }

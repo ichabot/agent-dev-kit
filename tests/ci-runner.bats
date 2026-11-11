@@ -266,7 +266,7 @@ EOF
   [ "$status" -ne 0 ]
 }
 
-@test "adk_ci_kill: cgroup.kill of the user slice, kill -1 as the user, then by pid; refuses self/root" {
+@test "adk_ci_kill: cgroup.kill below the user slice, kill -1 as the user, then by pid; runtime dir removed; refuses self/root" {
   run adk_ci_kill "$ME"
   [ "$status" -ne 0 ]
   [[ "$output" == *"refusing"* ]]
@@ -282,13 +282,23 @@ EOF
   kill() { echo "kill $*" >> "$LOG"; }
   sleep() { :; }
   ADK_CGROUP_ROOT="$T/cg"
-  mkdir -p "$T/cg/user.slice/user-4242.slice"
-  : > "$T/cg/user.slice/user-4242.slice/cgroup.kill"
+  S="$T/cg/user.slice/user-4242.slice"
+  mkdir -p "$S/user@4242.service" "$S/session-3.scope" "$S/user-runtime-dir@4242.service"
+  : > "$S/user@4242.service/cgroup.kill"; : > "$S/session-3.scope/cgroup.kill"
+  : > "$S/user-runtime-dir@4242.service/cgroup.kill"
+  ADK_RUN_USER_DIR="$T/run-user"
+  mkdir -p "$T/run-user/4242"
+  mountpoint() { return 1; }
   printf 'ci:500000:65536\n' > "$T/subuid-ci"
   ADK_SUBUID_FILE="$T/subuid-ci"
   run adk_ci_kill ci
   [ "$status" -eq 0 ]
-  [ "$(cat "$T/cg/user.slice/user-4242.slice/cgroup.kill")" = "1" ]
+  [ "$(cat "$S/user@4242.service/cgroup.kill")" = "1" ]
+  [ "$(cat "$S/session-3.scope/cgroup.kill")" = "1" ]
+  # root's helper that unmounts /run/user/UID is left alone; the runtime dir is gone afterwards
+  [ ! -s "$S/user-runtime-dir@4242.service/cgroup.kill" ]
+  grep -qx "systemctl stop user-runtime-dir@4242.service" "$LOG"
+  [ ! -e "$T/run-user/4242" ]
   grep -qx "as-uid ci kill -s KILL -- -1" "$LOG"
   grep -qx "kill -KILL 999999" "$LOG"
   grep -qx "systemctl stop user@4242.service" "$LOG"
