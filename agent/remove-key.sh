@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remove an SSH public key (by fingerprint) from a user's root-owned key file.
 #
-# Usage: sudo /opt/adk/agent/remove-key.sh [--force] [--terminate] <adk-admin|hermes> <SHA256:fingerprint>
+# Usage: sudo /opt/adk/agent/remove-key.sh [--force] [--terminate] <adk-admin|hermes|deploy> <SHA256:fingerprint>
 #
 #   --force      allow removing the last adk-admin key (locks every administrator out)
 #   --terminate  also end all sessions and tunnels of the user (loginctl terminate-user);
@@ -20,7 +20,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=lib/keyfile.sh
 source "$HERE/lib/keyfile.sh"
 
-usage() { echo "usage: $0 [--force] [--terminate] <adk-admin|hermes> <SHA256:fingerprint>" >&2; exit 2; }
+usage() { echo "usage: $0 [--force] [--terminate] <adk-admin|hermes|deploy> <SHA256:fingerprint>" >&2; exit 2; }
 
 force=false terminate=false
 while (($#)); do

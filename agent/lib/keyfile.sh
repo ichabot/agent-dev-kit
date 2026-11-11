@@ -7,14 +7,34 @@ _ADK_KEYFILE_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source-path=SCRIPTDIR/../.. source=scripts/lib/pubkey.sh
 source "$_ADK_KEYFILE_HERE/../../scripts/lib/pubkey.sh"
 
-# Users whose keys this kit manages (must match AllowUsers in sshd-adk.conf).
-ADK_KEY_USERS=(adk-admin hermes)
+# Users whose keys this kit manages (AllowUsers in agent/sshd-adk.conf: adk-admin hermes;
+# test/sshd-adk-test.conf: adk-admin deploy).
+ADK_KEY_USERS=(adk-admin hermes deploy)
+# Keys of these users are written with ADK_FORCED_PREFIX (add-key.sh --forced-command), never
+# as plain keys: the CI deploy key on the TEST VM may only start the deploy gate.
+ADK_FORCED_USERS=(deploy)
+ADK_FORCED_PREFIX='restrict,command="/opt/adk/test/deploy-gate.sh"'
 
 adk_check_key_user() {
   local u
   for u in "${ADK_KEY_USERS[@]}"; do [[ "$u" == "$1" ]] && return 0; done
   echo "ERROR: user must be one of: ${ADK_KEY_USERS[*]} (got '$1')" >&2
   return 1
+}
+
+# adk_is_forced_user USER: 0 if USER's keys are forced-command keys only
+adk_is_forced_user() {
+  local u
+  for u in "${ADK_FORCED_USERS[@]}"; do [[ "$u" == "$1" ]] && return 0; done
+  return 1
+}
+
+# adk_keyline_material LINE: "type base64" of a key file line, with or without the kit's
+# forced-command prefix
+adk_keyline_material() {
+  local line="$1"
+  [[ "$line" != "$ADK_FORCED_PREFIX "* ]] || line="${line#"$ADK_FORCED_PREFIX "}"
+  adk_pubkey_material "$line"
 }
 
 adk_keys_dir() { printf '%s\n' "${ADK_AUTH_KEYS_DIR:-/etc/ssh/authorized_keys}"; }
