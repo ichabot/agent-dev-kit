@@ -30,8 +30,11 @@ Cloud-Metadaten-Dienst (`169.254.169.254`, `fd00:ec2::254`) ist die nftables-Tab
 (`reject`, Verbindungsaufbau scheitert sofort) werden Pakete
 
 - von uid und gid `hermes` und `ci` **und ihren Sub-IDs** aus `/etc/subuid`/`/etc/subgid`:
-  In einem eigenen User-Namespace (`unshare --map-auto`, rootless Container, auch mit
-  `DOCKERD_ROOTLESS_ROOTLESSKIT_NET=host`) kann ein Benutzer nur zu diesen IDs wechseln;
+  In einem eigenen User-Namespace (`unshare --map-auto`, rootless Container mit `--user`)
+  kann ein Benutzer nur zu diesen IDs wechseln (getestet mit `unshare --user --map-auto
+  --map-root-user` + `setpriv --reuid=1`: ohne Sub-IDs in den Regeln war Gitea direkt
+  erreichbar, jetzt nicht; `DOCKERD_ROOTLESS_ROOTLESSKIT_NET=host` lehnt das installierte
+  rootless Docker ab);
 - als zweite Schicht von **allen Prozessen in der cgroup `user.slice`**: alle Sitzungen und
   User-Manager, also auch rootless Docker samt Containern, egal mit welcher ID. Das betrifft
   auch Admin-Sitzungen (`sudo curl 169.254.169.254` aus einer SSH-Sitzung von `adk-admin`
