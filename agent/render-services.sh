@@ -184,7 +184,6 @@ EOF
     cat <<EOF
     build:
       context: ./caddy
-    pull_policy: build
     env_file:
       - $SECRETS_DIR/caddy.env
 EOF

@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-dev-kit backup (Gitea dump, secrets, home of hermes)
+Documentation=file:///opt/adk/agent/backup.sh
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/adk/agent/backup.sh
+Nice=10
+IOSchedulingClass=idle

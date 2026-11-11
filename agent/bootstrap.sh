@@ -13,6 +13,8 @@
 # (root-owned, kit.env 0600), sudo /opt/adk/agent/setup.sh.
 # Only git-tracked files are copied; untracked or ignored files under scripts/ or agent/
 # (a stray token, a *.key) abort the run instead of landing world-readable in /opt/adk.
+# Lab/test only: ADK_TLS_INTERNAL and ADK_RUNNER_ADD_HOST from the environment are passed on
+# to setup.sh (see agent/render-services.sh); they are not kit.env keys.
 # Exit codes: 0 = done, 1 = failure, 2 = usage.
 set -euo pipefail
 export LC_ALL=C
@@ -40,6 +42,15 @@ done
 [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || usage
 [[ "$HOST" =~ ^[A-Za-z0-9.:-]+$ ]] || usage
 [[ -f "$CONFIG" ]] || { echo "ERROR: config file not found: $CONFIG" >&2; exit 2; }
+SETUP_ENV=""
+if [[ -n "${ADK_TLS_INTERNAL:-}" ]]; then
+  [[ "$ADK_TLS_INTERNAL" == 1 ]] || { echo "ERROR: ADK_TLS_INTERNAL must be 1 or empty" >&2; exit 2; }
+  SETUP_ENV+="ADK_TLS_INTERNAL=1 "
+fi
+if [[ -n "${ADK_RUNNER_ADD_HOST:-}" ]]; then
+  [[ "$ADK_RUNNER_ADD_HOST" =~ ^[0-9A-Fa-f.:]+$ ]] || { echo "ERROR: ADK_RUNNER_ADD_HOST must be an IP address" >&2; exit 2; }
+  SETUP_ENV+="ADK_RUNNER_ADD_HOST=$ADK_RUNNER_ADD_HOST "
+fi
 for tool in ssh rsync python3 git tar; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required on this machine"
 done
@@ -110,7 +121,7 @@ rsync -p --chown=root:root --chmod=F0600 -e "$RSYNC_SSH" --rsync-path="sudo rsyn
   "$CONFIG" "$TARGET:$REMOTE_DIR/kit.env"
 
 echo "== running setup.sh"
-remote "sudo $REMOTE_DIR/agent/setup.sh"
+remote "sudo $SETUP_ENV$REMOTE_DIR/agent/setup.sh"
 
 echo
 echo "Done. Add the employee's key for Hermes Desktop (read from stdin, never staged on the VPS):"

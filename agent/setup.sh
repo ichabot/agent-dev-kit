@@ -11,8 +11,13 @@
 # kit.env, base packages + unattended-upgrades (reboot 04:30, Debian and Docker CE), swap,
 # Docker CE (pinned apt key, root daemon for the kit's own services, log limits), sshd
 # drop-in, user hermes with rootless Docker, egress limits (nftables: no cloud metadata for
-# hermes), Hermes Agent for hermes. No LLM key is configured: the customer does that.
+# hermes and ci), Hermes Agent for hermes, then the services: Gitea + Caddy (root Docker
+# Compose, /opt/adk/services), Gitea accounts (gitea-init.sh), CI runner as user ci with its
+# own rootless Docker, backup timer. No LLM key is configured: the customer does that.
 # Root never reads or writes inside hermes's home; that is done as hermes (lib/host.sh).
+#
+# Lab/test only (environment, not kit.env): ADK_TLS_INTERNAL=1, ADK_RUNNER_ADD_HOST=<ip>,
+# see agent/render-services.sh.
 set -euo pipefail
 export LC_ALL=C
 
@@ -22,8 +27,15 @@ ROOT="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib/host.sh"
 # shellcheck source-path=SCRIPTDIR source=lib/rootless-user.sh
 source "$HERE/lib/rootless-user.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/versions.sh
+source "$HERE/lib/versions.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/services.sh
+source "$HERE/lib/services.sh"
+# shellcheck source-path=SCRIPTDIR source=../scripts/lib/config.sh
+source "$ROOT/scripts/lib/config.sh"
 
 AGENT_USER=hermes
+CI_USER=ci
 AUTH_KEYS_DIR=/etc/ssh/authorized_keys
 HERMES_INSTALLER=https://hermes-agent.nousresearch.com/install.sh
 HERMES_INSTALLER_SHA256="${HERMES_INSTALLER_SHA256:-}"
@@ -55,6 +67,9 @@ HERMES_INSTALLER_SHA256="${HERMES_INSTALLER_SHA256,,}"
 
 echo "== config"
 "$ROOT/scripts/check-config.sh" "$ROOT/kit.env"
+load_config "$ROOT/kit.env"
+[[ -z "${ADK_TLS_INTERNAL:-}" ]] || echo "WARNING: ADK_TLS_INTERNAL=${ADK_TLS_INTERNAL} (lab/test mode, no ACME)"
+[[ -z "${ADK_RUNNER_ADD_HOST:-}" ]] || echo "WARNING: ADK_RUNNER_ADD_HOST=${ADK_RUNNER_ADD_HOST} (lab/test mode)"
 
 echo "== base packages"
 adk_apt_install python3 libatomic1 curl ca-certificates git rsync uidmap \
@@ -182,10 +197,13 @@ rm -f "$old_dropin"
 echo "== user $AGENT_USER"
 adk_setup_rootless_user "$AGENT_USER"
 
+echo "== user $CI_USER (CI runner, own rootless Docker)"
+adk_setup_rootless_user "$CI_USER"
+
 echo "== egress limits (nftables)"
 # sshd's PermitOpen only limits tunnels; a shell as hermes has open outbound. This table is
-# the boundary for the cloud metadata service (uids: hermes; PR 2b adds ci).
-egress_rules="$(adk_egress_rules "$(id -u "$AGENT_USER")")"
+# the boundary for the cloud metadata service (uids: hermes and ci, incl. CI job containers).
+egress_rules="$(adk_egress_rules "$(id -u "$AGENT_USER")" "$(id -u "$CI_USER")")"
 egress_reload=false
 adk_put_file "$EGRESS_RULES" 0644 root:root <<< "$egress_rules" && egress_reload=true
 if adk_put_file "$EGRESS_UNIT" 0644 root:root <<EOF
@@ -256,6 +274,27 @@ else
   adk_changed "hermes installed"
 fi
 
+echo "== services (gitea, caddy)"
+adk_secrets_dir
+adk_gitea_secrets
+adk_caddy_env "${CFG[ACME_MODE]}"
+adk_render_services "$ROOT/kit.env"
+adk_services_up
+adk_lab_ca "$AGENT_USER" "$CI_USER"
+adk_wait_https "${CFG[GITEA_DOMAIN]}"
+
+init_out="$("$HERE/gitea-init.sh" --config "$ROOT/kit.env")" || { printf '%s\n' "$init_out"; adk_die "gitea-init.sh failed"; }
+printf '%s\n' "$init_out"
+ADK_CHANGES=$((ADK_CHANGES + $(grep -c '^changed:' <<< "$init_out" || true)))
+
+echo "== ci runner"
+adk_runner_binary
+adk_runner_setup "${CFG[GITEA_DOMAIN]}" "${CFG[CUSTOMER_NAME]}"
+
+echo "== backup"
+adk_backup_setup "${CFG[BACKUP_TARGET]}" "${CFG[CUSTOMER_NAME]}"
+
 echo
 echo "setup done: $ADK_CHANGES change(s)"
 echo "Next: add the employee's key (from stdin):  sudo $HERE/add-key.sh $AGENT_USER < key.pub"
+echo "Gitea: https://${CFG[GITEA_DOMAIN]}/ - initial password of ${CFG[GITEA_ADMIN_USER]}: /root/adk-gitea-initial-password (if not handed over yet)"
