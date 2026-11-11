@@ -69,11 +69,12 @@ case "$rc" in
 esac
 
 echo "== copying the kit to $REMOTE_DIR"
+# Fixed modes (dirs 0755, files 0644/0755) whatever the local umask; kit.env 0600.
 remote "sudo install -d -m 0755 -o root -g root $REMOTE_DIR"
 RSYNC_SSH="ssh $(printf '%q ' "${SSH_OPTS[@]}")"
 (
   cd "$ROOT"
-  rsync -rlp --delete --relative --chown=root:root --chmod=go-w \
+  rsync -rlp --delete --relative --chown=root:root --chmod=D0755,Fu+rw,Fgo-w,Fa+r,Fa+X \
     --exclude '__pycache__' -e "$RSYNC_SSH" --rsync-path="sudo rsync" \
     ./scripts ./agent ./docs/hermes-tuning.md "$TARGET:$REMOTE_DIR/"
 )

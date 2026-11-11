@@ -139,6 +139,11 @@ adk_setup_rootless_user "$AGENT_USER"
 
 echo "== hermes agent"
 agent_home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+# Top of ~/.bashrc so non-interactive SSH commands (ssh hermes@vps hermes ...) find it too;
+# the installer's own PATH line sits below Debian's early return for non-interactive shells.
+adk_put_block "$agent_home/.bashrc" "$AGENT_USER:$AGENT_USER" "adk hermes path" top <<'EOF'
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+EOF
 if [[ -x "$agent_home/.local/bin/hermes" ]]; then
   adk_ok "hermes installed ($(adk_user_env "$AGENT_USER" hermes --version 2>/dev/null | head -n1))"
 else
