@@ -55,7 +55,8 @@ need_yaml() {
   for l in "PasswordAuthentication no" "KbdInteractiveAuthentication no" "PermitRootLogin no" \
            "AuthorizedKeysFile /etc/ssh/authorized_keys/%u" "AllowTcpForwarding no" \
            "X11Forwarding no" "AllowUsers adk-admin hermes" "Match User hermes" \
-           "AllowTcpForwarding local" "PermitOpen 127.0.0.1:*"; do
+           "AllowTcpForwarding local" "PermitOpen 127.0.0.1:*" "AllowAgentForwarding no" \
+           "AllowStreamLocalForwarding no" "PermitTunnel no" "Match all"; do
     [[ "$output" == *"$l"* ]] || { echo "missing: $l"; return 1; }
   done
   [[ "$output" == *"/etc/ssh/sshd_config.d/10-adk.conf"* ]]
