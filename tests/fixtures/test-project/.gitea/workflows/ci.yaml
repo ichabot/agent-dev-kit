@@ -1,0 +1,58 @@
+# agent-dev-kit: CI of a customer project with deployment to the TEST VM (docs/test-vm.md).
+# Copy to .gitea/workflows/ci.yaml of the project (the repository name is the project name on
+# TEST: ^[a-z][a-z0-9-]{1,38}$) and replace the steps of job "test" with the real tests.
+#
+# Org-level settings (agent/test-deploy-key.sh sets them once per organization):
+#   secrets.TEST_DEPLOY_KEY          private SSH key; on TEST it can only start the deploy gate
+#   vars.TEST_DEPLOY_HOST            address of the TEST VM
+#   vars.TEST_DEPLOY_KNOWN_HOSTS     pinned SSH host keys of the TEST VM (no trust on first use)
+# Known limit: every workflow of every branch can read TEST_DEPLOY_KEY and so deploy ANY ref of
+# the organization's repositories to TEST. Accepted: TEST holds test data only, is reachable
+# only from the customer's networks, and the key can do nothing but "deploy <project> <ref>".
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ gitea.workflow }}-${{ gitea.event_name }}-${{ gitea.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Tests
+        run: |
+          test -x deploy/update.sh
+          python3 -c 'import json; p = json.load(open("deploy/adk.json"))["http_port"]; assert 1024 <= p <= 65535'
+
+  deploy-test:
+    needs: test
+    if: gitea.event_name == 'push' && gitea.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy this commit to TEST
+        env:
+          DEPLOY_KEY: ${{ secrets.TEST_DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ vars.TEST_DEPLOY_HOST }}
+          KNOWN_HOSTS: ${{ vars.TEST_DEPLOY_KNOWN_HOSTS }}
+          PROJECT: ${{ gitea.event.repository.name }}
+          REF: ${{ gitea.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$d/key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$d/known_hosts"
+          ssh -i "$d/key" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o UserKnownHostsFile="$d/known_hosts" -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 "deploy@$DEPLOY_HOST" deploy "$PROJECT" "$REF"
