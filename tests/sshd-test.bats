@@ -71,7 +71,7 @@ global_part() {
   need_sshd
   run eff adk-admin
   [ "$status" -eq 0 ]
-  ! grep -q '^forcecommand ' <<< "$output"
+  grep -qx "forcecommand none" <<< "$output"
   grep -qx "allowtcpforwarding no" <<< "$output"
 }
 
