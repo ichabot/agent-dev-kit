@@ -156,7 +156,7 @@ chmod 0600 "$docker_config/config.json"
 [[ -n "$T" ]] || chown -R "$APP_USER:$APP_USER" "$docker_config"
 say "running deploy/update.sh --non-interactive --additive-only --version $REF (as $APP_USER)"
 run_env=(env -i PATH="$APP_PATH" HOME="$dir/state" LC_ALL=C.UTF-8
-  DOCKER_CONFIG="$docker_config" COMPOSE_PROJECT_NAME="$PROJECT" ADK_PROJECT="$PROJECT"
+  DOCKER_CONFIG="$docker_config" COMPOSE_PROJECT_NAME="app-$PROJECT" ADK_PROJECT="$PROJECT"
   ADK_STATE_DIR="$dir/state" ADK_ENV="test")
 as_app=(runuser -u "$APP_USER" --)
 [[ -z "$T" ]] || as_app=()

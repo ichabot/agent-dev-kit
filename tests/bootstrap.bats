@@ -125,3 +125,24 @@ EOF
   ADK_TLS_INTERNAL=yes run "$K/agent/bootstrap.sh" --config "$CFG" 203.0.113.50
   [ "$status" -eq 2 ]
 }
+
+@test "--role test: copies scripts/ agent/ test/ and runs test/setup.sh" {
+  run "$K/agent/bootstrap.sh" --role test --config "$CFG" 203.0.113.60
+  [ "$status" -eq 0 ]
+  expected="$(git -C "$K" ls-files -- scripts agent test | LC_ALL=C sort)"
+  [ "$(cat "$STAGED")" = "$expected" ]
+  grep -q 'test/setup.sh' "$STAGED"
+  grep -q 'sudo /opt/adk/test/setup.sh' "$SSH_LOG"
+  ! grep -q 'agent/setup.sh' "$SSH_LOG" || return 1
+  [[ "$output" == *"test-deploy-key.sh"* ]]
+}
+
+@test "--role test: ADK_TLS_INTERNAL is passed on, the runner override is refused" {
+  ADK_TLS_INTERNAL=1 run "$K/agent/bootstrap.sh" --role test --config "$CFG" 203.0.113.60
+  [ "$status" -eq 0 ]
+  grep -q 'sudo ADK_TLS_INTERNAL=1 /opt/adk/test/setup.sh' "$SSH_LOG"
+  ADK_RUNNER_ADD_HOST=203.0.113.50 run "$K/agent/bootstrap.sh" --role test --config "$CFG" 203.0.113.60
+  [ "$status" -eq 2 ]
+  run "$K/agent/bootstrap.sh" --role prod --config "$CFG" 203.0.113.60
+  [ "$status" -eq 2 ]
+}
