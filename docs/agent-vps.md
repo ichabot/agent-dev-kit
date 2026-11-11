@@ -51,7 +51,11 @@ Drop-in (`/etc/systemd/system/nftables.service.d/50-adk-egress.conf`) sie nach j
 und Reload von `nftables.service` sofort wieder, und `adk-egress.service` hängt per `PartOf=`
 an `nftables.service` (Stop/Neustart wirken mit). Der CI-Runner läuft nur zusammen mit den
 Regeln (`Requires=`/`BindsTo=adk-egress.service`) und startet nicht, wenn die Tabelle fehlt;
-ein Neustart der Regeln beendet einen laufenden Job (mit Wipe).
+ein Neustart der Regeln beendet einen laufenden Job (mit Wipe). Nicht abgedeckt ist ein
+`nft flush ruleset` oder `nft -f /etc/nftables.conf` von Hand (an systemd vorbei): Dann fehlt
+die Tabelle, bis `sudo systemctl restart adk-egress` läuft (der Runner startet so lange keinen
+neuen Job). Debians `flush ruleset` entfernt außerdem die Regeln von Docker (Port 443 zu
+Caddy); nach einem Neustart von nftables daher `sudo systemctl restart docker`.
 
 `setup.sh` liest und schreibt im Home von `hermes` nur als `hermes` selbst (`runuser`) und
 bricht ab, wenn dort ein Symlink im Pfad liegt (`~/.bashrc`, `~/.config/docker` …). So kann
@@ -355,7 +359,8 @@ Täglich um 03:30 schreibt `agent/backup.sh` nach `/var/backups/adk/<UTC-Zeit>/`
   dann wird er beendet und der Teil gilt als fehlgeschlagen), danach startet Gitea wieder –
   auch bei Fehlern, wenn das Skript abgebrochen wird oder der Server währenddessen
   herunterfährt (`ExecStopPost=backup.sh --ensure-gitea` startet Gitea, wenn eine
-  Markierungsdatei zeigt, dass das Backup es gestoppt hat). So schreibt während des Dumps
+  Markierungsdatei zeigt, dass das Backup es gestoppt hat; nach Absturz oder Stromausfall
+  macht das `adk-backup-recover.service` beim nächsten Start). So schreibt während des Dumps
   niemand (keine Pushes des Agenten, keine Jobs); Gitea ist dafür einige Sekunden bis Minuten
   nicht erreichbar, ein um 03:30 laufender Job kann daran scheitern.
 - `adk-secrets.tar`: `/opt/adk/secrets` + `kit.env`.
@@ -519,6 +524,16 @@ noch seinen SSH-Zugang, Schritte 5–6 noch das API-Token.
   Token nur bei `hermes`, temporäres Token gelöscht, Idempotenz, abweichende Teams,
   Bot als Admin/Owner), `backup.sh` (Inhalt, Ausschlüsse, Symlinks, Aufbewahrung, Fehler),
   `restore.sh` (Argumente, Prüfsummen, `FAILED`).
+- `make check`, Review-Runde 2: Wipe löscht in `/tmp` & Co. nur als `ci` (`find -delete`), ein
+  zwischen Aufzählen und Löschen gegen einen Symlink getauschtes Verzeichnis führt nie nach
+  außen (deterministischer Test und Dauer-Tausch-Test), Spool-Verzeichnisse nur, wenn kein
+  normaler Benutzer sie ändern kann, Konto gesperrt/abgelaufen + Linger aus, `cgroup.kill`
+  (ohne `user-runtime-dir@`), SysV-IPC per ID, Runner-Unit (Egress-Bindung,
+  `RuntimeMaxSec`), nftables-Drop-in, `cron.deny`/`at.deny`; Teams ohne „alle Repos“, Zugriff
+  erst nach dem Schutz, Sperre und eigener Token-Name; Backup-Kopfzeile, `*.age`-Prüfsummen,
+  Dump-Timeout, Gitea-Neustart bei Abbruch/Signal/Boot; Restore: umbenanntes Backup, fremder
+  Server, Chiffrat vor dem Entschlüsseln, Kopie unsicherer Verzeichnisse; `.pub` aus dem
+  privaten Schlüssel.
 - Integrationstest auf einer Test-VM (Debian-13-Cloud-Image mit genau diesem
   Cloud-Init, ohne Hetzner-Firewall): `bootstrap.sh` zweimal, zweiter Lauf ohne
   Änderungen; `sshd -T`-Werte; root- und Passwort-Login abgelehnt; Agent- und
@@ -558,6 +573,27 @@ noch seinen SSH-Zugang, Schritte 5–6 noch das API-Token.
   aus der verschlüsselten Kopie (ohne `--age-identity` und mit verändertem `MANIFEST`
   abgelehnt) → Repo, Commits und Registry-Paket wieder da, Home als `hermes` entpackt,
   keine Reste des Entschlüsselungsverzeichnisses; Timer gelistet.
+- Integrationstest nach Review-Runde 2 (frische VM, gleiche Parameter): `bootstrap.sh` bis 0
+  Änderungen, HTTPS/Header, offen nur 22 und 443; ein neues Repo ist für `agent-bot` unsichtbar
+  (404, Clone scheitert), `gitea-init.sh` warnt, erst nach `protect-repo.sh` hat er Zugriff
+  (zweiter Lauf ohne Änderungen); `agent-bot`-Grenzen wie oben. **Tausch-Angriff:** `hermes`
+  legt `/tmp/H/J` (0777) an, ein Job legt dort Dateien von `ci` und einer Sub-UID an, während
+  des Wipes tauscht `hermes` `J` rund 30 000-mal gegen einen Symlink auf ein root-eigenes
+  Verzeichnis – dessen Dateien bleiben, die Job-Dateien sind weg. Cron/`at`: `crontab`/`at` als
+  `ci` abgelehnt; trotzdem untergeschobene Einträge (Deny-Listen kurz entfernt) sind nach dem
+  Wipe aus den Spools gelöscht und laufen nicht mehr (Journal). Ein Container mit
+  `--restart always`, der ständig Prozesse erzeugt, und eine Endlosschleife als User-Unit von
+  `ci` (300+ Prozesse): danach 0 Prozesse von `ci`/Sub-UIDs. Eine Datei in `/run/user/<ci>`
+  ist im nächsten Job weg (der Test fand hier einen Fehler der ersten Fassung: `cgroup.kill`
+  traf den Stop von `user-runtime-dir@`, behoben). Der Folgejob sieht keine Images, Container,
+  Units oder Dateien des vorigen. `systemctl restart`/`reload nftables`: Tabelle bleibt
+  geladen; ohne Tabelle startet der Runner nicht, mit ihr wieder. Ein hängender Job wird
+  durch `RuntimeMaxSec` (im Test per Drop-in verkürzt) beendet, der Wipe läuft. Backup: Kopfzeile
+  und `*.age`-Prüfsummen signiert; Restore aus der Off-Site-Kopie (Verzeichnis gehört dem
+  SFTP-Benutzer → root-eigene Kopie) stellt das gelöschte Repo wieder her; abgelehnt: älteres
+  Backup unter dem Namen des neueren, Chiffrat eines anderen Backups. Gitea läuft wieder nach
+  `kill -9` des Backups während des Dumps, nach `systemctl stop` und nach einem Neustart des
+  Servers mit zurückgebliebener Markierung (`adk-backup-recover.service`).
 - Noch nicht geprüft (PR 6, E2E): echter Hetzner-API-Lauf, ACME mit echtem DNS-Anbieter,
   Off-Site-Backup auf eine Storage Box (Host-Key-Fingerprint von Hetzner), Port-Scan von außen
   durch die Hetzner-Firewall.
