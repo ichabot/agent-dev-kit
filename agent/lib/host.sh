@@ -40,6 +40,17 @@ adk_put_file() {
   return "$changed"
 }
 
+# adk_resolved_conf: systemd-resolved drop-in. Debian's cloud images answer LLMNR on
+# 0.0.0.0:5355 (and could do mDNS); nothing on this server needs either.
+adk_resolved_conf() {
+  cat <<'EOF'
+# agent-dev-kit: no LLMNR/mDNS listeners (only ssh and https are open)
+[Resolve]
+LLMNR=no
+MulticastDNS=no
+EOF
+}
+
 # adk_apt_install PKG...: install the packages that are missing (apt-get update only then)
 adk_apt_install() {
   local missing=() p

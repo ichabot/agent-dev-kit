@@ -323,3 +323,11 @@ snapshot() {
   fi
   [ "$status" -eq 0 ]
 }
+
+@test "adk_resolved_conf: no LLMNR and no mDNS listeners (only 22/443 are open)" {
+  run adk_resolved_conf
+  [ "$status" -eq 0 ]
+  grep -qx '\[Resolve\]' <<< "$output"
+  grep -qx 'LLMNR=no' <<< "$output"
+  grep -qx 'MulticastDNS=no' <<< "$output"
+}

@@ -114,6 +114,15 @@ for unit in apt-daily.timer apt-daily-upgrade.timer; do
   fi
 done
 
+echo "== resolver"
+if systemctl is-enabled --quiet systemd-resolved 2>/dev/null; then
+  if adk_put_file /etc/systemd/resolved.conf.d/50-adk.conf 0644 root:root < <(adk_resolved_conf); then
+    systemctl restart systemd-resolved
+  fi
+else
+  adk_ok "systemd-resolved not in use (no LLMNR listener)"
+fi
+
 echo "== swap"
 if [[ -n "$(swapon --show --noheadings)" ]]; then
   adk_ok "swap active"
