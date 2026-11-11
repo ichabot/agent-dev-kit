@@ -468,15 +468,32 @@ noch seinen SSH-Zugang, Schritte 5–6 noch das API-Token.
   nicht (Timeout, Zähler unverändert); `add-key.sh` über stdin; unattended-upgrades
   aktiv; Swap aktiv.
 - Integrationstest Dienste (Test-VM mit `ADK_TLS_INTERNAL=1`): Gitea über Caddy per HTTPS,
-  Header gesetzt; offen nur 22 und 443, Gitea auf keinem Host-Port, `:2019` zu (auch im
-  Container); `hermes`/`ci` erreichen Gitea nicht direkt über die Container-IP;
-  Mitarbeiter-Login führt zur Passwortänderung, API mit Startpasswort 403; `agent-bot` (Token
-  aus der Datei von `hermes`, als `hermes`) klont und pusht per Credential-Helper, Push auf
-  geschütztes `main`, Repo anlegen, Branch-Schutz/Repo-/Org-Einstellungen ändern, Merge und
-  Owner-Beitritt abgelehnt; Workflow im rootless Runner: `docker build` + Push in die
-  Registry und ein Layer über 100 MB grün, root-Docker-Socket im Job nicht nutzbar,
-  Metadaten-Dienst für `ci` gesperrt (Zähler steigt); Backup per systemd → Repo löschen →
-  `restore.sh` → Repo, Commits und Registry-Paket wieder da; Restore des Homes als `hermes`;
-  Timer gelistet.
+  Header gesetzt; von außen offen nur 22 und 443 (LLMNR 5355 abgeschaltet), Gitea auf keinem
+  Host-Port, `:2019` zu; Mitarbeiter-Login führt zur Passwortänderung (Kennzeichen bleibt
+  nach jedem `setup.sh`-Lauf gesetzt); `agent-bot` (Token aus der Datei von `hermes`, als
+  `hermes`, Scopes ohne `write:package`) klont und pusht Feature-Branches; abgelehnt: Push auf
+  `main`, Tag-Push und Tag-Löschen, Release anlegen, Repo anlegen (Organisation und eigener
+  Namensraum), Merge des eigenen PR – auch nach Freigabe durch den Mitarbeiter (nur der
+  Mitarbeiter merged), Branch-/Tag-Schutz, Repo-/Org-Einstellungen, Owner-Beitritt,
+  Actions-Secrets lesen, `docker push` in die Registry; `protect-repo.sh` zweimal (zweiter Lauf
+  ohne Änderungen), `gitea-init.sh` warnt vorher vor dem ungeschützten Repo, danach nicht;
+  CI: Job im rootless Docker von `ci` (root-Socket nicht nutzbar, Metadaten gesperrt, Job-Token
+  von der Registry abgelehnt, `docker build` + Push mit Publisher-Token aus einem
+  Actions-Secret grün); **zwei Jobs nacheinander**: Job 1 legt ein Image-Tag, einen
+  Container mit `--restart always`, eine User-Unit in `~ci/.config/systemd/user` und eine Datei
+  in `/tmp` an und liest das Runner-Verzeichnis (Registrierungsdatei ist während des Jobs
+  schon verbraucht/entfernt), Job 2 findet nichts davon; jede Registrierung ist ephemer und
+  nach ihrem Job gelöscht; Egress: `unshare --user --map-auto --map-root-user` + `setpriv
+  --reuid=1` als `hermes` erreichte mit den alten Regeln Gitea direkt, mit den neuen weder
+  Gitea:3000 noch den Metadaten-Dienst (sofort abgewiesen, Zähler steigt), root in einer
+  Admin-Sitzung ebenso (cgroup-Schicht); DNS-Token-Rotation per `set-secret.sh` + `setup.sh`
+  erzeugt Caddy neu (Token in der Umgebung = Datei, nur Hashes verglichen); Backup per
+  systemd mit signiertem `MANIFEST` und `age`-verschlüsselter Off-Site-Kopie per SFTP auf
+  einen lokalen zweiten sshd (ohne festgelegten Host-Key und mit falschem Fingerprint
+  abgelehnt; am Ziel nur `*.age`, `MANIFEST`, `MANIFEST.sig`); Repo löschen → `restore.sh`
+  aus der verschlüsselten Kopie (ohne `--age-identity` und mit verändertem `MANIFEST`
+  abgelehnt) → Repo, Commits und Registry-Paket wieder da, Home als `hermes` entpackt,
+  keine Reste des Entschlüsselungsverzeichnisses; Timer gelistet.
 - Noch nicht geprüft (PR 6, E2E): echter Hetzner-API-Lauf, ACME mit echtem DNS-Anbieter,
-  Off-Site-Backup auf eine Storage Box, Port-Scan von außen.
+  Off-Site-Backup auf eine Storage Box (Host-Key-Fingerprint von Hetzner), Port-Scan von außen
+  durch die Hetzner-Firewall.
