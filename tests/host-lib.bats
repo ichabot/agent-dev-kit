@@ -260,42 +260,63 @@ snapshot() {
 
 # --- egress rules (nftables) -------------------------------------------------------
 
-@test "adk_egress_rules blocks the metadata service for the given uids only" {
-  run adk_egress_rules 1000 1001
+@test "adk_egress_rules blocks the metadata service for the given uids, gids and user sessions" {
+  run adk_egress_rules "1000 1001" "1000 1001"
   [ "$status" -eq 0 ]
   [[ "$output" == *"table inet adk_egress"* ]]
   [[ "$output" == *"delete table inet adk_egress"* ]]
-  [[ "$output" == *"elements = { 1000, 1001 }"* ]]
   [[ "$output" == *"169.254.169.254"* ]]
   [[ "$output" == *"fd00:ec2::254"* ]]
   [[ "$output" == *"hook output"* ]]
-  [[ "$output" == *"meta skuid @restricted_uids ip daddr @metadata_v4 counter reject"* ]]
-  [[ "$output" == *"meta skuid @restricted_uids ip6 daddr @metadata_v6 counter reject"* ]]
-  run adk_egress_rules 1000
+  [[ "$output" == *"meta skuid @restricted_uids jump restricted"* ]]
+  [[ "$output" == *"meta skgid @restricted_gids jump restricted"* ]]
+  [[ "$output" == *"ip daddr @metadata_v4 counter reject"* ]]
+  [[ "$output" == *"ip6 daddr @metadata_v6 counter reject"* ]]
+  run adk_egress_rules 1000 1000
   [[ "$output" == *"elements = { 1000 }"* ]]
 }
 
-@test "adk_egress_rules keeps the uids away from root Docker containers except ports 80/443" {
-  run adk_egress_rules 1001 1002
+@test "adk_egress_rules: subordinate id ranges are in the sets (interval sets)" {
+  run adk_egress_rules "1001 1002 100000-165535 165536-231071" "1001 1002 100000-165535 165536-231071"
   [ "$status" -eq 0 ]
-  # published ports (Caddy) stay reachable, also after Docker's DNAT of the host address
-  [[ "$output" == *'meta skuid @restricted_uids oifname "br-*" tcp dport { 80, 443 } accept'* ]]
-  [[ "$output" == *'meta skuid @restricted_uids oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
-  [[ "$output" == *'meta skuid @restricted_uids oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
+  [ "$(grep -c 'flags interval' <<< "$output")" -eq 2 ]
+  [ "$(grep -c 'elements = { 1001, 1002, 100000-165535, 165536-231071 }' <<< "$output")" -eq 2 ]
+  grep -q 'type uid' <<< "$output"
+  grep -q 'type gid' <<< "$output"
 }
 
-@test "adk_egress_rules refuses non-numeric or root uids" {
-  run adk_egress_rules hermes
+@test "adk_egress_rules: second layer by cgroup (all user sessions and user managers)" {
+  run adk_egress_rules 1001 1001
+  [[ "$output" == *'socket cgroupv2 level 1 "user.slice" jump restricted'* ]]
+}
+
+@test "adk_egress_rules keeps the uids away from root Docker containers except ports 80/443" {
+  run adk_egress_rules "1001 1002" "1001"
+  [ "$status" -eq 0 ]
+  # published ports (Caddy) stay reachable, also after Docker's DNAT of the host address
+  [[ "$output" == *'oifname "br-*" tcp dport { 80, 443 } accept'* ]]
+  [[ "$output" == *'oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
+  [[ "$output" == *'oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"'* ]]
+}
+
+@test "adk_egress_rules refuses non-numeric, root or reversed ids" {
+  run adk_egress_rules hermes 1000
   [ "$status" -ne 0 ]
-  run adk_egress_rules 0
+  run adk_egress_rules 0 1000
   [ "$status" -ne 0 ]
-  run adk_egress_rules
+  run adk_egress_rules 1000 0-5
+  [ "$status" -ne 0 ]
+  run adk_egress_rules 200-100 1000
+  [ "$status" -ne 0 ]
+  run adk_egress_rules "" 1000
+  [ "$status" -ne 0 ]
+  run adk_egress_rules 1000
   [ "$status" -ne 0 ]
 }
 
 @test "adk_egress_rules output is accepted by nft (if available)" {
   command -v nft > /dev/null || skip "nft not installed"
-  adk_egress_rules 1000 > "$BATS_TEST_TMPDIR/egress.nft"
+  adk_egress_rules "1000 100000-165535" "1000 100000-165535" > "$BATS_TEST_TMPDIR/egress.nft"
   run nft -c -f "$BATS_TEST_TMPDIR/egress.nft"
   if [[ "$output" == *"Operation not permitted"* || "$output" == *"ermission denied"* ]]; then
     skip "nft -c needs CAP_NET_ADMIN here"

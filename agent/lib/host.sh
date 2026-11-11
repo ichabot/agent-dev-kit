@@ -153,33 +153,66 @@ adk_gpg_key_fpr_is() {
   [[ "$(awk -F: '$1 == "pub" {p = 1; next} p && $1 == "fpr" {print $10; exit}' <<< "$out")" == "$want" ]]
 }
 
-# adk_egress_rules UID...: nftables ruleset (table inet adk_egress) that rejects traffic from
-# these users to the cloud metadata service and to containers of the ROOT Docker daemon other
-# than their ports 80/443 (Caddy; also reached there after Docker's DNAT of the host address),
-# so Gitea is reachable only through Caddy (reject, not drop: connect() fails at once with
-# EHOSTUNREACH instead of hanging until a timeout). Loaded by adk-egress.service with nft -f;
-# replaces the table as a whole, so re-loading is idempotent. Add more uids (e.g. ci) as
-# arguments; root (0) is refused because the kit's own services need nothing from it either
-# way and a typo must not lock root out.
+# adk_subid_ranges FILE USER UID: "start-end" for each line of /etc/subuid or /etc/subgid that
+# belongs to USER (by name or numeric id)
+adk_subid_ranges() {
+  awk -F: -v u="$2" -v id="$3" '($1 == u || $1 == id) && $2 ~ /^[0-9]+$/ && $3 ~ /^[1-9][0-9]*$/ {printf "%d-%d\n", $2, $2 + $3 - 1}' "$1"
+}
+
+# adk_egress_rules "UID|RANGE..." "GID|RANGE...": nftables ruleset (table inet adk_egress)
+# that rejects traffic of the restricted users to the cloud metadata service and to
+# containers of the ROOT Docker daemon other than their ports 80/443 (Caddy; also reached
+# there after Docker's DNAT of the host address), so Gitea is reachable only through Caddy
+# (reject, not drop: connect() fails at once with EHOSTUNREACH instead of a timeout).
+# Restricted are sockets of
+#   - the given uids and gids, incl. ranges "lo-hi" for the users' /etc/subuid and
+#     /etc/subgid ranges: a user namespace (unshare --map-auto, rootless containers on the
+#     host network) can switch to those ids but never to others;
+#   - every process in the cgroup user.slice (all user sessions and user managers, so also
+#     rootless Docker and its containers, whatever their ids) as a second layer. The path is
+#     resolved when the table is loaded; user.slice is static, adk-egress.service creates it.
+# Loaded by adk-egress.service with nft -f; replaces the table as a whole (idempotent). Root
+# (0) is refused as an id: a typo must not cut root off.
 adk_egress_rules() {
-  local u joined
-  (($#)) || { echo "ERROR: adk_egress_rules: no uid given" >&2; return 1; }
-  for u in "$@"; do
-    [[ "$u" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: adk_egress_rules: not a non-root uid: $u" >&2; return 1; }
+  local kind list e lo hi out joined_uids="" joined_gids=""
+  local -A seen
+  (($# == 2)) || { echo "ERROR: adk_egress_rules: need a uid list and a gid list" >&2; return 1; }
+  for kind in uid gid; do
+    if [[ "$kind" == uid ]]; then list="$1"; else list="$2"; fi
+    seen=() out=""
+    for e in ${list//,/ }; do
+      if [[ "$e" =~ ^([1-9][0-9]*)-([1-9][0-9]*)$ ]]; then
+        lo="${BASH_REMATCH[1]}" hi="${BASH_REMATCH[2]}"
+        ((lo <= hi)) || { echo "ERROR: adk_egress_rules: reversed range: $e" >&2; return 1; }
+      elif [[ ! "$e" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: adk_egress_rules: not a non-root $kind or range: $e" >&2
+        return 1
+      fi
+      [[ -z "${seen[$e]:-}" ]] || continue
+      seen[$e]=1
+      out+="${out:+, }$e"
+    done
+    [[ -n "$out" ]] || { echo "ERROR: adk_egress_rules: no $kind given" >&2; return 1; }
+    if [[ "$kind" == uid ]]; then joined_uids="$out"; else joined_gids="$out"; fi
   done
-  printf -v joined '%s, ' "$@"
-  joined="${joined%, }"
   cat <<EOF
 # agent-dev-kit: egress limits for unprivileged users (agent/setup.sh, adk-egress.service).
-# Real boundary behind sshd's PermitOpen: these uids (and their rootless containers, whose
-# traffic leaves through the user's slirp4netns) cannot reach the cloud metadata service, nor
-# root Docker containers except on ports 80/443 (Gitea only through Caddy).
+# Real boundary behind sshd's PermitOpen: these uids/gids (incl. their subordinate ranges) and
+# everything in user.slice (sessions, user managers, rootless Docker and its containers,
+# whose traffic leaves through slirp4netns) cannot reach the cloud metadata service, nor root
+# Docker containers except on ports 80/443 (Gitea only through Caddy).
 table inet adk_egress {}
 delete table inet adk_egress
 table inet adk_egress {
   set restricted_uids {
     type uid
-    elements = { $joined }
+    flags interval
+    elements = { $joined_uids }
+  }
+  set restricted_gids {
+    type gid
+    flags interval
+    elements = { $joined_gids }
   }
   set metadata_v4 {
     type ipv4_addr
@@ -189,14 +222,19 @@ table inet adk_egress {
     type ipv6_addr
     elements = { fd00:ec2::254 }
   }
+  chain restricted {
+    ip daddr @metadata_v4 counter reject with icmpx admin-prohibited comment "cloud metadata"
+    ip6 daddr @metadata_v6 counter reject with icmpx admin-prohibited comment "cloud metadata"
+    oifname "br-*" tcp dport { 80, 443 } accept
+    oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"
+    oifname "docker0" tcp dport { 80, 443 } accept
+    oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"
+  }
   chain output {
     type filter hook output priority filter; policy accept;
-    meta skuid @restricted_uids ip daddr @metadata_v4 counter reject with icmpx admin-prohibited comment "cloud metadata"
-    meta skuid @restricted_uids ip6 daddr @metadata_v6 counter reject with icmpx admin-prohibited comment "cloud metadata"
-    meta skuid @restricted_uids oifname "br-*" tcp dport { 80, 443 } accept
-    meta skuid @restricted_uids oifname "br-*" counter reject with icmpx admin-prohibited comment "root docker networks"
-    meta skuid @restricted_uids oifname "docker0" tcp dport { 80, 443 } accept
-    meta skuid @restricted_uids oifname "docker0" counter reject with icmpx admin-prohibited comment "root docker networks"
+    meta skuid @restricted_uids jump restricted
+    meta skgid @restricted_gids jump restricted
+    socket cgroupv2 level 1 "user.slice" jump restricted
   }
 }
 EOF

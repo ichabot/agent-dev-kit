@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Agent VPS services for agent/setup.sh (run as root): secrets, Gitea + Caddy (root Docker
-# Compose project "adk"), Gitea runner as user ci (rootless Docker), backup timer.
-# Requires host.sh and versions.sh sourced. Every step reports ok/changed (ADK_CHANGES).
+# Compose project "adk"), Gitea runner as user ci (rootless Docker, lib/ci-runner.sh), backup
+# timer. Requires host.sh, versions.sh and ci-runner.sh sourced. Every step reports ok/changed (ADK_CHANGES).
 
 ADK_SECRETS_DIR=/opt/adk/secrets
 ADK_SERVICES_DIR=/opt/adk/services
 ADK_COMPOSE_FILE="$ADK_SERVICES_DIR/compose.yaml"
 ADK_DATA_DIR=/var/lib/adk
 ADK_RUNNER_CONFIG=/etc/adk/runner.yaml
-ADK_RUNNER_STATE=/var/lib/adk-runner
 ADK_RUNNER_BIN=/usr/local/bin/gitea-runner
 ADK_RUNNER_UNIT=/etc/systemd/system/adk-act-runner.service
 ADK_LAB_CA=/usr/local/share/ca-certificates/adk-lab-caddy-root.crt
@@ -167,7 +166,8 @@ adk_wait_https() {
 }
 
 # adk_lab_ca USER...: ADK_TLS_INTERNAL=1 only. Trust Caddy's internal root CA on this host
-# (system store; rootless dockerds of USER... restarted so registry pushes trust it).
+# (system store; rootless dockerds of USER... and the CI runner, whose prepare step starts a
+# fresh dockerd for ci, restarted so registry pushes trust it).
 adk_lab_ca() {
   local tmp i u changed=false
   if [[ "${ADK_TLS_INTERNAL:-}" != 1 ]]; then
@@ -218,64 +218,17 @@ adk_runner_binary() {
   adk_changed "gitea-runner $ADK_RUNNER_VERSION installed ($arch, sha256 verified)"
 }
 
-# adk_runner_setup DOMAIN CUSTOMER: state dir, registration (token piped, never printed),
-# systemd system unit running as ci with ci's rootless Docker.
-adk_runner_setup() {
-  local domain="$1" customer="$2" uid unit_changed=false
-  uid="$(id -u ci)"
-  if [[ -L "$ADK_RUNNER_STATE" ]]; then adk_die "$ADK_RUNNER_STATE is a symlink"; fi
-  if [[ "$(stat -c '%a %U:%G' "$ADK_RUNNER_STATE" 2>/dev/null)" != "700 ci:ci" ]]; then
-    install -d -m 0700 -o ci -g ci "$ADK_RUNNER_STATE"
-    adk_changed "$ADK_RUNNER_STATE (ci 0700)"
-  fi
+# adk_runner_service DOMAIN: systemd unit of the runner (lib/ci-runner.sh: one job per run,
+# root wipes and prepares user ci around every job, ephemeral registration), enabled and
+# running. (Re)starting it runs the prepare step, so errors show up here.
+adk_runner_service() {
+  local domain="$1" unit_changed=false
   if getent ahosts "$domain" >/dev/null; then
     adk_ok "$domain resolves ($(getent ahosts "$domain" | awk 'NR == 1 {print $1}'))"
   else
     adk_die "$domain does not resolve on this host; create the DNS record first (the runner talks to https://$domain)"
   fi
-  # ci's files are checked as ci (root never looks inside a directory ci controls)
-  if adk_as_user ci test -f "$ADK_RUNNER_STATE/.runner"; then
-    adk_ok "runner registered"
-  else
-    # The registration token goes from Gitea's CLI through a pipe into the environment of the
-    # register process (readable only by ci and root), never into argv or a file.
-    # shellcheck disable=SC2016  # expanded by the inner sh
-    if ! adk_compose exec -T -u git gitea gitea actions generate-runner-token < /dev/null 2>/dev/null \
-        | tail -n 1 \
-        | adk_as_user ci env HOME="$ADK_RUNNER_STATE" sh -c 'cd "$1" && IFS= read -r GITEA_RUNNER_REGISTRATION_TOKEN && export GITEA_RUNNER_REGISTRATION_TOKEN && exec "$2" -c "$3" register --no-interactive --instance "$4" --name "$5"' \
-          sh "$ADK_RUNNER_STATE" "$ADK_RUNNER_BIN" "$ADK_RUNNER_CONFIG" "https://$domain" "adk-$customer"; then
-      adk_die "runner registration failed"
-    fi
-    adk_changed "runner adk-$customer registered at https://$domain"
-  fi
-  if adk_put_file "$ADK_RUNNER_UNIT" 0644 root:root <<EOF
-[Unit]
-Description=agent-dev-kit CI runner (Gitea runner as user ci, rootless Docker)
-After=network-online.target user@$uid.service
-Wants=network-online.target user@$uid.service
-
-[Service]
-Type=simple
-User=ci
-Group=ci
-WorkingDirectory=$ADK_RUNNER_STATE
-Environment=HOME=$ADK_RUNNER_STATE
-Environment=XDG_RUNTIME_DIR=/run/user/$uid
-Environment=DOCKER_HOST=unix:///run/user/$uid/docker.sock
-ExecStart=$ADK_RUNNER_BIN --config $ADK_RUNNER_CONFIG daemon
-Restart=always
-RestartSec=10
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  then
+  if adk_put_file "$ADK_RUNNER_UNIT" 0644 root:root < <(adk_runner_unit "$(id -u "$ADK_CI_USER")"); then
     systemctl daemon-reload
     unit_changed=true
   fi
@@ -284,10 +237,13 @@ EOF
     adk_changed "adk-act-runner.service enabled"
   fi
   if [[ "$unit_changed" == true || "$ADK_RUNNER_CONFIG_CHANGED" == true ]] || ! systemctl is-active --quiet adk-act-runner.service; then
-    systemctl restart adk-act-runner.service
-    adk_changed "adk-act-runner.service (re)started"
+    if ! systemctl restart adk-act-runner.service; then
+      journalctl -u adk-act-runner.service --no-pager -n 30 -o cat >&2 || true
+      adk_die "adk-act-runner.service did not start (prepare step failed, see above)"
+    fi
+    adk_changed "adk-act-runner.service (re)started: fresh environment, ephemeral registration"
   else
-    adk_ok "adk-act-runner.service running"
+    adk_ok "adk-act-runner.service running (one job per run)"
   fi
 }
 

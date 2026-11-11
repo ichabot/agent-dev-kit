@@ -177,7 +177,8 @@ y() {
   need_yaml
   "$RENDER" --config "$CFG" --out "$OUT"
   r() { y "$OUT/runner.yaml" "$1"; }
-  [ "$(r 'c["runner"]["capacity"]')" = "2" ]
+  # one job at a time: the runner process ends after it and the environment is wiped
+  [ "$(r 'c["runner"]["capacity"]')" = "1" ]
   [ "$(r 'c["runner"]["file"]')" = "/var/lib/adk-runner/.runner" ]
   [ "$(r 'c["runner"]["insecure"]')" = "False" ]
   [[ "$(r 'c["runner"]["labels"][0]')" =~ ^ubuntu-latest:docker://docker\.io/gitea/runner-images:[^@]+@sha256:[0-9a-f]{64}$ ]]

@@ -12,8 +12,8 @@
 # Docker CE (pinned apt key, root daemon for the kit's own services, log limits), sshd
 # drop-in, user hermes with rootless Docker, egress limits (nftables: no cloud metadata for
 # hermes and ci), Hermes Agent for hermes, then the services: Gitea + Caddy (root Docker
-# Compose, /opt/adk/services), Gitea accounts (gitea-init.sh), CI runner as user ci with its
-# own rootless Docker, backup timer. No LLM key is configured: the customer does that.
+# Compose, /opt/adk/services), Gitea accounts (gitea-init.sh), CI runner as user ci (one job
+# per run, fresh rootless Docker per job, lib/ci-runner.sh), backup timer. No LLM key is configured: the customer does that.
 # Root never reads or writes inside hermes's home; that is done as hermes (lib/host.sh).
 #
 # Lab/test only (environment, not kit.env): ADK_TLS_INTERNAL=1, ADK_RUNNER_ADD_HOST=<ip>,
@@ -29,6 +29,10 @@ source "$HERE/lib/host.sh"
 source "$HERE/lib/rootless-user.sh"
 # shellcheck source-path=SCRIPTDIR source=lib/versions.sh
 source "$HERE/lib/versions.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/gitea-admin.sh
+source "$HERE/lib/gitea-admin.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/ci-runner.sh
+source "$HERE/lib/ci-runner.sh"
 # shellcheck source-path=SCRIPTDIR source=lib/services.sh
 source "$HERE/lib/services.sh"
 # shellcheck source-path=SCRIPTDIR source=../scripts/lib/config.sh
@@ -198,13 +202,22 @@ rm -f "$old_dropin"
 echo "== user $AGENT_USER"
 adk_setup_rootless_user "$AGENT_USER"
 
-echo "== user $CI_USER (CI runner, own rootless Docker)"
-adk_setup_rootless_user "$CI_USER"
+echo "== user $CI_USER (CI runner)"
+# Only the account here: its rootless Docker is set up fresh before every CI job by the
+# runner unit (agent/ci-reset.sh prepare) and wiped after it.
+adk_ensure_unprivileged_user "$CI_USER"
 
 echo "== egress limits (nftables)"
 # sshd's PermitOpen only limits tunnels; a shell as hermes has open outbound. This table is
 # the boundary for the cloud metadata service (uids: hermes and ci, incl. CI job containers).
-egress_rules="$(adk_egress_rules "$(id -u "$AGENT_USER")" "$(id -u "$CI_USER")")"
+# uids/gids incl. the subordinate ranges (user namespaces can switch to those), plus all of
+# user.slice as a second layer (adk_egress_rules in lib/host.sh).
+egress_uids="" egress_gids=""
+for u in "$AGENT_USER" "$CI_USER"; do
+  egress_uids+=" $(id -u "$u") $(adk_subid_ranges /etc/subuid "$u" "$(id -u "$u")" | tr '\n' ' ')"
+  egress_gids+=" $(id -g "$u") $(adk_subid_ranges /etc/subgid "$u" "$(id -u "$u")" | tr '\n' ' ')"
+done
+egress_rules="$(adk_egress_rules "$egress_uids" "$egress_gids")"
 egress_reload=false
 adk_put_file "$EGRESS_RULES" 0644 root:root <<< "$egress_rules" && egress_reload=true
 if adk_put_file "$EGRESS_UNIT" 0644 root:root <<EOF
@@ -220,6 +233,9 @@ Conflicts=shutdown.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# The ruleset matches the cgroup user.slice, resolved at load time: create it if systemd has
+# not yet (early boot); systemd adopts the existing directory.
+ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/user.slice
 ExecStart=/usr/sbin/nft -f $EGRESS_RULES
 ExecReload=/usr/sbin/nft -f $EGRESS_RULES
 ExecStop=/usr/sbin/nft delete table inet adk_egress
@@ -282,7 +298,7 @@ adk_caddy_env "${CFG[ACME_MODE]}"
 adk_gitea_user
 adk_render_services "$ROOT/kit.env"
 adk_services_up
-adk_lab_ca "$AGENT_USER" "$CI_USER"
+adk_lab_ca "$AGENT_USER"
 adk_wait_https "${CFG[GITEA_DOMAIN]}"
 
 init_out="$("$HERE/gitea-init.sh" --config "$ROOT/kit.env")" || { printf '%s\n' "$init_out"; adk_die "gitea-init.sh failed"; }
@@ -291,7 +307,7 @@ ADK_CHANGES=$((ADK_CHANGES + $(grep -c '^changed:' <<< "$init_out" || true)))
 
 echo "== ci runner"
 adk_runner_binary
-adk_runner_setup "${CFG[GITEA_DOMAIN]}" "${CFG[CUSTOMER_NAME]}"
+adk_runner_service "${CFG[GITEA_DOMAIN]}"
 
 echo "== backup"
 adk_backup_setup "${CFG[BACKUP_TARGET]}" "${CFG[CUSTOMER_NAME]}"
