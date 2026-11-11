@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
-# Create (or bring in line) the agent VPS in the customer's Hetzner Cloud project.
+# Create (or bring in line) the agent VPS or the TEST VM in the customer's Hetzner Cloud
+# project.
 #
-# Usage: agent/provision.sh [--pubkey FILE] [--admin-source CIDR]... [--config FILE] [--dry-run]
+# Usage: agent/provision.sh [--role agent|test] [--pubkey FILE] [--admin-source CIDR]...
+#                           [--config FILE] [--dry-run]
+#        test/provision.sh  [--pubkey FILE] [--admin-source CIDR]... [--config FILE] [--dry-run]
+#                           (the same as agent/provision.sh --role test)
 #
+#   --role agent|test    agent (default): server adk-<customer>-agent (AGENT_TYPE), backups
+#                        on; if the TEST VM exists, tcp 443 from its addresses (it fetches
+#                        deploy files and images from Gitea).
+#                        test: server adk-<customer>-test (TEST_TYPE), no backups (test data
+#                        only); the agent VPS must exist: tcp 22 from its addresses (CI deploy
+#                        job). Afterwards the agent's firewall is applied again (--role agent,
+#                        same --admin-source), which adds the TEST VM's addresses there.
 #   --pubkey FILE        installer's SSH public key (uploaded as adk-<customer>-installer,
 #                        installed for adk-admin by cloud-init). Needed only to create the
 #                        server; with an existing server no ssh key is looked up or uploaded
@@ -13,7 +24,7 @@
 #   --dry-run            print the planned API requests, send nothing, need no token
 #
 # Idempotent by name: ssh key adk-<customer>-installer, firewall and server
-# adk-<customer>-agent. Objects with these names that lack the labels
+# adk-<customer>-<role>. Objects with these names that lack the labels
 # managed-by=agent-dev-kit and customer=<customer> are never modified. The firewall is
 # attached at create time, so the server is never reachable unfiltered; a server with any
 # other firewall attached is refused (Hetzner adds up the allow rules of all firewalls).
@@ -37,13 +48,14 @@ API="https://api.hetzner.cloud/v1"
 POLL_INTERVAL="${ADK_POLL_INTERVAL:-3}"
 POLL_MAX="${ADK_POLL_MAX:-200}"
 
-usage() { echo "usage: $0 [--pubkey FILE] [--admin-source CIDR]... [--config FILE] [--dry-run]" >&2; exit 2; }
+usage() { echo "usage: $0 [--role agent|test] [--pubkey FILE] [--admin-source CIDR]... [--config FILE] [--dry-run]" >&2; exit 2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-CONFIG="$ROOT/kit.env" PUBKEY="" DRY_RUN=false
+CONFIG="$ROOT/kit.env" PUBKEY="" DRY_RUN=false ROLE=agent
 ADMIN_ARGS=()
 while (($#)); do
   case "$1" in
+    --role) (($# >= 2)) || usage; ROLE="$2"; shift 2 ;;
     --pubkey) (($# >= 2)) || usage; PUBKEY="$2"; shift 2 ;;
     --admin-source) (($# >= 2)) || usage; ADMIN_ARGS+=(--admin-source "$2"); shift 2 ;;
     --config) (($# >= 2)) || usage; CONFIG="$2"; shift 2 ;;
@@ -52,6 +64,7 @@ while (($#)); do
   esac
 done
 [[ "$POLL_MAX" =~ ^[1-9][0-9]*$ ]] || usage
+[[ "$ROLE" == agent || "$ROLE" == test ]] || usage
 [[ -f "$CONFIG" ]] || { echo "ERROR: config file not found: $CONFIG" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
@@ -59,12 +72,18 @@ trap 'rm -rf "$WORK"' EXIT
 hc() { python3 -I "$HERE/lib/hcloud.py" "$@"; }
 
 # --- local inputs (validated before anything is sent) ---------------------
-"$HERE/firewall-rules.sh" --config "$CONFIG" "${ADMIN_ARGS[@]}" > "$WORK/rules.json"
+# (rules without the other server's addresses; those are added after the lookup)
+"$HERE/firewall-rules.sh" --config "$CONFIG" --role "$ROLE" "${ADMIN_ARGS[@]}" > "$WORK/rules.json"
 load_config "$CONFIG"
 customer="${CFG[CUSTOMER_NAME]}"
 KEY_NAME="adk-$customer-installer"
-FW_NAME="adk-$customer-agent"
-SRV_NAME="adk-$customer-agent"
+FW_NAME="adk-$customer-$ROLE"
+SRV_NAME="adk-$customer-$ROLE"
+if [[ "$ROLE" == agent ]]; then
+  SRV_TYPE="${CFG[AGENT_TYPE]}" OTHER="adk-$customer-test" OTHER_FLAG=--extra-https-source
+else
+  SRV_TYPE="${CFG[TEST_TYPE]}" OTHER="adk-$customer-agent" OTHER_FLAG=--extra-ssh-source
+fi
 
 if [[ -n "$PUBKEY" ]]; then
   rc=0
@@ -72,7 +91,7 @@ if [[ -n "$PUBKEY" ]]; then
   ((rc == 0)) || exit "$rc"
   md5="$(ssh-keygen -l -E md5 -f - <<< "$key" | cut -d' ' -f2)"
   md5="${md5#MD5:}"
-  "$HERE/render-cloud-init.sh" --pubkey "$PUBKEY" > "$WORK/user-data"
+  "$HERE/render-cloud-init.sh" --pubkey "$PUBKEY" --role "$ROLE" > "$WORK/user-data"
   hc sshkey "$KEY_NAME" "$key" "$customer" > "$WORK/sshkey.json"
 fi
 hc firewall "$FW_NAME" "$customer" "$WORK/rules.json" > "$WORK/firewall.json"
@@ -84,6 +103,12 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "#    the run, so does any other firewall attached to the server)"
   echo "GET /servers?name=$SRV_NAME"
   echo "GET /firewalls?name=$FW_NAME"
+  if [[ "$ROLE" == agent ]]; then
+    echo "#    the TEST VM, if it exists: tcp 443 from its IPv4 and IPv6 network (Gitea, registry)"
+  else
+    echo "#    the agent VPS (must exist): tcp 22 from its IPv4 and IPv6 network (CI deploy job)"
+  fi
+  echo "GET /servers?name=$OTHER"
   if [[ -n "$PUBKEY" ]]; then
     echo "# 2. only if the server does not exist: ssh key, uploaded unless found by name"
     echo "#    (same key) or fingerprint"
@@ -93,18 +118,26 @@ if [[ "$DRY_RUN" == true ]]; then
   else
     echo "# 2. no --pubkey: the server must exist; no ssh key is looked up or uploaded"
   fi
-  echo "# 3. firewall: created, or an existing one gets these rules (set_rules)"
+  echo "# 3. firewall: created, or an existing one gets these rules (set_rules), plus the rule"
+  echo "#    for the addresses of $OTHER"
   echo "POST /firewalls $(cat "$WORK/firewall.json")"
   if [[ -n "$PUBKEY" ]]; then
-    hc server "$SRV_NAME" "${CFG[AGENT_TYPE]}" "${CFG[HCLOUD_LOCATION]}" "$customer" \
+    hc server "$SRV_NAME" "$SRV_TYPE" "${CFG[HCLOUD_LOCATION]}" "$customer" \
       "<id of ssh key $KEY_NAME>" "<id of firewall $FW_NAME>" "$WORK/user-data" > "$WORK/server.json"
     echo "# 4. server: created with the firewall attached (an existing one only gets the firewall applied)"
     echo "POST /servers $(hc truncate "$WORK/server.json")"
   else
     echo "# 4. server: must exist; gets the firewall applied if it is missing"
   fi
-  echo "# 5. backups: enabled unless already enabled"
-  echo "POST /servers/<id>/actions/enable_backup"
+  if [[ "$ROLE" == agent ]]; then
+    echo "# 5. backups: enabled unless already enabled"
+    echo "POST /servers/<id>/actions/enable_backup"
+  else
+    echo "# 5. no backups: the TEST VM holds test data only"
+    echo "# 6. agent firewall applied again (agent/provision.sh --role agent, same --admin-source):"
+    echo "#    tcp 443 from the TEST VM's IPv4 and IPv6 network"
+    echo "POST /firewalls/<id-of-adk-$customer-agent>/actions/set_rules"
+  fi
   exit 0
 fi
 
@@ -192,6 +225,27 @@ if ((${#foreign_fw[@]})); then
   die "server $SRV_NAME has other firewalls attached (id ${foreign_fw[*]}); Hetzner adds up the allow rules of all firewalls - detach them first"
 fi
 
+# The other server: agent -> the TEST VM may pull from Gitea; test -> the agent VPS deploys.
+api_ok GET "/servers?name=$OTHER"
+other_id="$(field_id servers.0.id)"
+other_sources=()
+if [[ -n "$other_id" ]]; then
+  require_managed server "$OTHER" servers.0
+  for f in servers.0.public_net.ipv4.ip servers.0.public_net.ipv6.ip; do
+    v="$(field "$f")"
+    [[ -z "$v" ]] || other_sources+=("$OTHER_FLAG" "$v")
+  done
+elif [[ "$ROLE" == test ]]; then
+  die "the agent VPS $OTHER does not exist: run agent/provision.sh first (the TEST VM is deployed from its CI)"
+fi
+if ((${#other_sources[@]})); then
+  "$HERE/firewall-rules.sh" --config "$CONFIG" --role "$ROLE" "${ADMIN_ARGS[@]}" "${other_sources[@]}" \
+    > "$WORK/rules.json" || die "the addresses of $OTHER are not usable as firewall sources"
+  hc firewall "$FW_NAME" "$customer" "$WORK/rules.json" > "$WORK/firewall.json"
+  hc set-rules "$WORK/rules.json" > "$WORK/set-rules.json"
+  echo "firewall $FW_NAME: with the addresses of $OTHER (${other_sources[*]})"
+fi
+
 key_id="" key_note=""
 if [[ -z "$srv_id" ]]; then
   [[ -n "$PUBKEY" ]] || die "server $SRV_NAME does not exist yet: --pubkey is required to create it"
@@ -242,7 +296,7 @@ if [[ -n "$srv_id" ]]; then
   fi
   echo "server $SRV_NAME: exists (id $srv_id)"
 else
-  hc server "$SRV_NAME" "${CFG[AGENT_TYPE]}" "${CFG[HCLOUD_LOCATION]}" "$customer" \
+  hc server "$SRV_NAME" "$SRV_TYPE" "${CFG[HCLOUD_LOCATION]}" "$customer" \
     "$key_id" "$fw_id" "$WORK/user-data" > "$WORK/server.json"
   api_ok POST /servers "$WORK/server.json"
   srv_id="$(field_id server.id)"
@@ -251,9 +305,11 @@ else
   echo "server $SRV_NAME: created (id $srv_id)"
 fi
 
-# backups
+# backups (agent only: the TEST VM holds test data only)
 api_ok GET "/servers/$srv_id"
-if [[ -z "$(field server.backup_window)" ]]; then
+if [[ "$ROLE" == test ]]; then
+  echo "backups: not used for the TEST VM (test data only)"
+elif [[ -z "$(field server.backup_window)" ]]; then
   api_ok POST "/servers/$srv_id/actions/enable_backup"
   action_id="$(field_id action.id)"
   wait_action "$action_id"
@@ -271,4 +327,11 @@ echo
 echo "IPv4: ${ipv4:-none}"
 echo "IPv6: ${ipv6:-none}${ipv6_net:+ (network $ipv6_net)}"
 echo
-echo "Next: agent/bootstrap.sh --identity <private key${PUBKEY:+ of $PUBKEY}> ${ipv4:-$ipv6}"
+if [[ "$ROLE" == agent ]]; then
+  echo "Next: agent/bootstrap.sh --identity <private key${PUBKEY:+ of $PUBKEY}> ${ipv4:-$ipv6}"
+  exit 0
+fi
+echo "Next: agent/bootstrap.sh --role test --identity <private key${PUBKEY:+ of $PUBKEY}> ${ipv4:-$ipv6}"
+echo
+echo "== agent firewall: tcp 443 from the TEST VM (agent/provision.sh --role agent)"
+exec "$HERE/provision.sh" --role agent --config "$CONFIG" "${ADMIN_ARGS[@]}"

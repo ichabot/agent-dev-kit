@@ -121,7 +121,12 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 
 **Security-Gate:** 443 nur für `CUSTOMER_IPS`; 22 nur von Agent-VPS (Deploy) und Kunden-IPs. Deploy-Key in Gitea-Secrets, auf der VM per `command="/opt/deploy/deploy.sh"` eingeschränkt – kein Shell-Zugang für CI.
 
-**Dateien:** `test/provision.sh`, `test/cloud-init.yaml`, `test/Caddyfile.tmpl`, `test/deploy.sh`, Tests.
+**Dateien (umgesetzt):** `test/provision.sh` (= `agent/provision.sh --role test`, Cloud-Init über `agent/render-cloud-init.sh --role test`), `test/sshd-adk-test.conf`, `test/setup.sh` + `test/lib/test-host.sh`, `test/render-services.sh` (Caddyfile + Compose statt Template), `test/deploy-gate.sh`, `test/deploy.sh` + `test/lib/deploy.py`, `test/deploy-test.workflow.yaml`, `agent/test-deploy-key.sh`, `agent/test-pull-token.sh`, gemeinsame Libs `agent/lib/base.sh` und `agent/lib/caddy.sh`, Erweiterungen in `agent/firewall-rules.sh` (`--role test`, `--extra-https-source`), `agent/add-key.sh` (`--forced-command deploy`), `agent/set-secret.sh` (`gitea-pull-token`), `agent/gitea-init.sh` (Bot `test-pull`), `agent/bootstrap.sh` (`--role test`); Doku `docs/test-vm.md`; Tests `tests/{deploy-gate,deploy,test-services,test-keys,sshd-test}.bats`, Fixture `tests/fixtures/test-project/`.
+
+**Ergebnisse aus PR 3:**
+- Deploy-Weg: CI-Job → `ssh deploy@TEST deploy <projekt> <sha>` → Key-Option `restrict,command=` + `ForceCommand` → `deploy-gate.sh` (Grammatik) → eine sudoers-Regel mit Argument-Regex → `deploy.sh` (root, prüft erneut). Der Deploy-Key liegt als Org-Actions-Secret vor; jeder Branch-Job kann damit jeden Stand auf TEST deployen (bewusst akzeptiert, `docs/test-vm.md`).
+- `deploy/update.sh` der Projekte läuft auf TEST als `adk-app` (Gruppe `docker`) – Projekt-Compose ist root-gleich, TEST ist der Explosionsradius.
+- Vertrag für PR 4: `deploy/adk.json` (`{"http_port": N}`), `deploy/update.sh --non-interactive --additive-only --version <ref>` im Verzeichnis `/srv/test/<projekt>` (`deploy/`, `.env`, `state/`), `/healthz`.
 
 **Tasks:**
 1. Firewall + Server, IP der TEST-VM in die Agent-Firewall (für Registry-Pull) eintragen.

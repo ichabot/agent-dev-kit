@@ -20,6 +20,13 @@ token), FAKE_STATE:
   html           the API answers with a non-JSON body (proxy error page)
   badid          the server id in the response is not a number
   unauthorized   every request gets 401
+FAKE_TEST (the TEST VM adk-acme-test, server 34, firewall 23):
+  absent (default)  neither server nor firewall exist; POST /servers creates it (marker file
+                    FAKE_LOG.test-created), later lookups find it
+  existing          server and firewall exist (firewall attached)
+  foreign           a server adk-acme-test without the kit's labels
+  noipv6            server exists with IPv4 only
+  privateip         server with a non-public IPv4 (refused as firewall source)
 """
 import json
 import os
@@ -70,6 +77,18 @@ if state == "foreign":
     server["labels"] = {}
 if state == "badid":
     server["id"] = "33/../../ssh_keys"
+TEST_STATE = os.environ.get("FAKE_TEST", "absent")
+TEST_MARKER = os.environ["FAKE_LOG"] + ".test-created"
+test_server = {"id": 34, "name": "adk-acme-test", "labels": labels, "backup_window": None,
+               "public_net": {"ipv4": {"ip": "198.51.100.60"}, "ipv6": {"ip": "2001:db8:6::/64"},
+                              "firewalls": [{"id": 23, "status": "applied"}]}}
+if TEST_STATE == "foreign":
+    test_server["labels"] = {}
+if TEST_STATE == "noipv6":
+    test_server["public_net"] = dict(test_server["public_net"], ipv6=None)
+if TEST_STATE == "privateip":
+    test_server["public_net"] = dict(test_server["public_net"], ipv4={"ip": "10.0.0.5"})
+TEST_EXISTS = TEST_STATE != "absent" or os.path.exists(TEST_MARKER)
 SERVER_EXISTS = state in ("existing", "nofw", "nobackup", "extrafw", "othercustomer", "foreign", "badid")
 FIREWALL_EXISTS = SERVER_EXISTS or state == "fwforeign"
 
@@ -102,6 +121,19 @@ if method == "GET" and path.startswith("/ssh_keys?fingerprint="):
     respond(200, {"ssh_keys": []})
 if method == "POST" and path == "/ssh_keys":
     respond(201, {"ssh_key": {"id": 11, "name": "adk-acme-installer", "fingerprint": fp}})
+if method == "GET" and path == "/firewalls?name=adk-acme-test":
+    respond(200, {"firewalls": [{"id": 23, "name": "adk-acme-test", "labels": labels}] if TEST_EXISTS else []})
+if method == "POST" and path == "/firewalls" and json.loads(body)["name"] == "adk-acme-test":
+    respond(201, {"firewall": {"id": 23, "name": "adk-acme-test", "labels": labels}, "actions": []})
+if method == "POST" and path == "/firewalls/23/actions/set_rules":
+    respond(201, {"actions": [{"id": 56, "status": "running"}]})
+if method == "GET" and path == "/servers?name=adk-acme-test":
+    respond(200, {"servers": [test_server] if TEST_EXISTS else []})
+if method == "POST" and path == "/servers" and json.loads(body)["name"] == "adk-acme-test":
+    open(TEST_MARKER, "w").close()
+    respond(201, {"server": test_server, "action": {"id": 54, "status": "running"}})
+if method == "GET" and path == "/servers/34":
+    respond(200, {"server": test_server})
 if method == "GET" and path.startswith("/firewalls?name="):
     if state == "fwforeign":
         respond(200, {"firewalls": [{"id": 22, "name": "adk-acme-agent", "labels": {}}]})

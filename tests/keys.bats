@@ -196,3 +196,57 @@ fp() { ssh-keygen -l -f "$1" | cut -d' ' -f2; }
   grep -qx "loginctl terminate-user hermes" "$BATS_TEST_TMPDIR/calls.log"
   [[ "$output" == *"crontab"* ]]
 }
+
+# --- deploy user (TEST VM): forced-command keys only ----------------------------
+
+GATE_PREFIX='restrict,command="/opt/adk/test/deploy-gate.sh"'
+
+@test "add-key --forced-command deploy: key line restricted to the deploy gate" {
+  run "$ADD" --forced-command deploy < "$BATS_TEST_TMPDIR/a.pub"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$ADK_AUTH_KEYS_DIR/deploy")" = "$GATE_PREFIX $(cat "$BATS_TEST_TMPDIR/a.pub")" ]
+  [ "$(stat -c %a "$ADK_AUTH_KEYS_DIR/deploy")" = "644" ]
+  [[ "$output" == *"$(fp "$BATS_TEST_TMPDIR/a.pub")"* ]]
+}
+
+@test "add-key: deploy without --forced-command is refused" {
+  run "$ADD" deploy < "$BATS_TEST_TMPDIR/a.pub"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--forced-command"* ]]
+  [ ! -e "$ADK_AUTH_KEYS_DIR/deploy" ]
+}
+
+@test "add-key: --forced-command for other users is refused" {
+  for u in adk-admin hermes; do
+    run "$ADD" --forced-command "$u" < "$BATS_TEST_TMPDIR/a.pub"
+    [ "$status" -eq 2 ] || { echo "accepted for $u"; return 1; }
+  done
+  [ -z "$(ls -A "$ADK_AUTH_KEYS_DIR")" ]
+}
+
+@test "add-key: deploy key dedupe ignores the options; key options from stdin are refused" {
+  "$ADD" --forced-command deploy < "$BATS_TEST_TMPDIR/a.pub"
+  run "$ADD" --forced-command deploy < "$BATS_TEST_TMPDIR/a.pub"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already"* ]]
+  [ "$(wc -l < "$ADK_AUTH_KEYS_DIR/deploy")" -eq 1 ]
+  printf 'command="/bin/sh" %s\n' "$(cat "$BATS_TEST_TMPDIR/b.pub")" > "$BATS_TEST_TMPDIR/opt.pub"
+  run "$ADD" --forced-command deploy < "$BATS_TEST_TMPDIR/opt.pub"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$ADK_AUTH_KEYS_DIR/deploy")" -eq 1 ]
+}
+
+@test "add-key: a plain hermes key does not count as present for deploy (and vice versa)" {
+  "$ADD" hermes < "$BATS_TEST_TMPDIR/a.pub"
+  run "$ADD" --forced-command deploy < "$BATS_TEST_TMPDIR/a.pub"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"added"* ]]
+}
+
+@test "remove-key removes a deploy key by fingerprint" {
+  "$ADD" --forced-command deploy < "$BATS_TEST_TMPDIR/a.pub"
+  "$ADD" --forced-command deploy < "$BATS_TEST_TMPDIR/b.pub"
+  run "$REMOVE" deploy "$(fp "$BATS_TEST_TMPDIR/a.pub")"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$ADK_AUTH_KEYS_DIR/deploy")" = "$GATE_PREFIX $(cat "$BATS_TEST_TMPDIR/b.pub")" ]
+}

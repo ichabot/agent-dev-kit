@@ -53,7 +53,7 @@ no_match() {
   run "$PROV" --config "$CFG" --pubkey "$KEY.pub" --dry-run
   [ "$status" -eq 0 ]
   got="$(grep -oE '^(GET|POST) [^ ]+' <<< "$output" | tr '\n' ';')"
-  [ "$got" = "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;POST /ssh_keys;POST /firewalls;POST /servers;POST /servers/<id>/actions/enable_backup;" ]
+  [ "$got" = "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;GET /servers?name=adk-acme-test;GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;POST /ssh_keys;POST /firewalls;POST /servers;POST /servers/<id>/actions/enable_backup;" ]
 }
 
 @test "dry-run without --pubkey: only firewall and backups, server must exist" {
@@ -61,7 +61,7 @@ no_match() {
   run "$PROV" --config "$CFG" --dry-run
   [ "$status" -eq 0 ]
   got="$(grep -oE '^(GET|POST) [^ ]+' <<< "$output" | tr '\n' ';')"
-  [ "$got" = "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;POST /firewalls;POST /servers/<id>/actions/enable_backup;" ]
+  [ "$got" = "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;GET /servers?name=adk-acme-test;POST /firewalls;POST /servers/<id>/actions/enable_backup;" ]
   [[ "$output" == *"must exist"* ]]
 }
 
@@ -172,7 +172,7 @@ no_match() {
   FAKE_STATE=empty run "$PROV" --config "$CFG" --pubkey "$KEY.pub"
   [ "$status" -eq 0 ]
   got="$(cut -d' ' -f1,2 "$FAKE_LOG" | tr '\n' ';')"
-  [[ "$got" == "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;POST /ssh_keys;POST /firewalls;POST /servers;GET /actions/44;GET /servers/33;POST /servers/33/actions/enable_backup;GET /actions/45;"* ]]
+  [[ "$got" == "GET /servers?name=adk-acme-agent;GET /firewalls?name=adk-acme-agent;GET /servers?name=adk-acme-test;GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;POST /ssh_keys;POST /firewalls;POST /servers;GET /actions/44;GET /servers/33;POST /servers/33/actions/enable_backup;GET /actions/45;"* ]]
   srv="$(grep -m1 '^POST /servers ' "$FAKE_LOG")"
   srv="${srv#POST /servers }"
   [ "$(j "$srv" 'd["firewalls"]')" = "[{'firewall': 22}]" ]
@@ -321,4 +321,110 @@ no_match() {
   [[ "$output" == *"401"* ]]
   [[ "$output" == *"unable to authenticate"* ]]
   [[ "$output" != *"$FAKE_TOKEN"* ]]
+}
+
+# --- agent firewall: the TEST VM pulls from Gitea ----------------------------
+
+# rules_of FW_ID: the rules JSON of the last set_rules request for firewall FW_ID
+rules_of() {
+  local line
+  line="$(grep "^POST /firewalls/$1/actions/set_rules " "$FAKE_LOG" | tail -n1)"
+  j "${line#POST /firewalls/"$1"/actions/set_rules }" 'json.dumps(d["rules"])'
+}
+
+@test "agent: existing TEST VM adds tcp 443 from its IPv4 and IPv6 network" {
+  FAKE_STATE=existing FAKE_TEST=existing run "$PROV" --config "$CFG"
+  [ "$status" -eq 0 ]
+  r="$(rules_of 22)"
+  [ "$(j "$r" '[x["source_ips"] for x in d if x.get("port") == "443"]')" = "[['203.0.113.10/32', '198.51.100.0/29', '2001:db8::/48'], ['198.51.100.60/32', '2001:db8:6::/64']]" ]
+}
+
+@test "agent: without TEST VM no extra https rule" {
+  FAKE_STATE=existing run "$PROV" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [ "$(j "$(rules_of 22)" 'len([x for x in d if x.get("port") == "443"])')" -eq 1 ]
+}
+
+@test "agent: a foreign server named like the TEST VM is refused before any change" {
+  FAKE_STATE=existing FAKE_TEST=foreign run "$PROV" --config "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"adk-acme-test"*"managed-by"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "agent: a TEST VM with a non-public address is refused (no private sources)" {
+  FAKE_STATE=existing FAKE_TEST=privateip run "$PROV" --config "$CFG"
+  [ "$status" -eq 1 ]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+# --- role test ----------------------------------------------------------------
+
+@test "test/provision.sh is agent/provision.sh --role test" {
+  run "$ROOT/test/provision.sh" --config "$CFG" --pubkey "$KEY.pub" --dry-run
+  [ "$status" -eq 0 ]
+  got="$(grep -oE '^(GET|POST) [^ ]+' <<< "$output" | tr '\n' ';')"
+  [ "$got" = "GET /servers?name=adk-acme-test;GET /firewalls?name=adk-acme-test;GET /servers?name=adk-acme-agent;GET /ssh_keys?name=adk-acme-installer;GET /ssh_keys?fingerprint=$FAKE_FP;POST /ssh_keys;POST /firewalls;POST /servers;POST /firewalls/<id-of-adk-acme-agent>/actions/set_rules;" ]
+  b="$(body POST /servers)"
+  [ "$(j "$b" 'd["name"]')" = "adk-acme-test" ]
+  [ "$(j "$b" 'd["server_type"]')" = "cx23" ]
+  [[ "$(j "$b" 'd["user_data"]')" == "#cloud-config"* ]]
+  [ "$(j "$(body POST /firewalls)" 'd["name"]')" = "adk-acme-test" ]
+  [[ "$output" == *"no backups"* ]]
+  [ ! -s "$FAKE_ARGV" ]
+}
+
+@test "test: fresh TEST VM: ssh from the agent, then the agent firewall gets the TEST IPs" {
+  FAKE_STATE=existing run "$ROOT/test/provision.sh" --config "$CFG" --pubkey "$KEY.pub" --admin-source 198.51.100.77
+  [ "$status" -eq 0 ]
+  # TEST server created with the TEST firewall and the TEST sshd drop-in, no backups
+  srv="$(grep -m1 '^POST /servers ' "$FAKE_LOG")"
+  srv="${srv#POST /servers }"
+  [ "$(j "$srv" 'd["name"]')" = "adk-acme-test" ]
+  [ "$(j "$srv" 'd["firewalls"]')" = "[{'firewall': 23}]" ]
+  [[ "$(j "$srv" 'd["user_data"]')" == *"ForceCommand /opt/adk/test/deploy-gate.sh"* ]]
+  no_match 'servers/34/actions/enable_backup' "$FAKE_LOG"
+  fw="$(grep -m1 '^POST /firewalls ' "$FAKE_LOG")"
+  fw="${fw#POST /firewalls }"
+  [ "$(j "$fw" '[x["source_ips"] for x in d["rules"] if x.get("port") == "22"]')" = "[['203.0.113.10/32', '198.51.100.0/29', '2001:db8::/48'], ['203.0.113.50/32', '2001:db8:5::/64'], ['198.51.100.77/32']]" ]
+  [ "$(j "$fw" 'len([x for x in d["rules"] if x["protocol"] == "udp"])')" -eq 0 ]
+  # then the agent firewall: https from the TEST VM, admin rule kept
+  r="$(rules_of 22)"
+  [ "$(j "$r" '[x["source_ips"] for x in d if x.get("port") == "443"][1]')" = "['198.51.100.60/32', '2001:db8:6::/64']" ]
+  [ "$(j "$r" '[x["source_ips"] for x in d if x.get("port") == "22"][1]')" = "['198.51.100.77/32']" ]
+  [[ "$output" == *"bootstrap.sh --role test"* ]]
+}
+
+@test "test: existing TEST VM: idempotent, only rules re-applied on both firewalls" {
+  FAKE_STATE=existing FAKE_TEST=existing run "$ROOT/test/provision.sh" --config "$CFG"
+  [ "$status" -eq 0 ]
+  no_match -E '^POST /(ssh_keys|firewalls|servers) ' "$FAKE_LOG"
+  no_match 'enable_backup' "$FAKE_LOG"
+  grep -q '^POST /firewalls/23/actions/set_rules ' "$FAKE_LOG"
+  grep -q '^POST /firewalls/22/actions/set_rules ' "$FAKE_LOG"
+}
+
+@test "test: refused without the agent VPS, before any change" {
+  FAKE_STATE=empty run "$ROOT/test/provision.sh" --config "$CFG" --pubkey "$KEY.pub"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"agent VPS"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "test: TEST VM without the kit's labels is not touched" {
+  FAKE_STATE=existing FAKE_TEST=foreign run "$ROOT/test/provision.sh" --config "$CFG"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"managed-by"* ]]
+  no_match '^POST' "$FAKE_LOG"
+}
+
+@test "test: IPv4-only TEST VM gets an IPv4-only https rule on the agent" {
+  FAKE_STATE=existing FAKE_TEST=noipv6 run "$ROOT/test/provision.sh" --config "$CFG"
+  [ "$status" -eq 0 ]
+  [ "$(j "$(rules_of 22)" '[x["source_ips"] for x in d if x.get("port") == "443"][1]')" = "['198.51.100.60/32']" ]
+}
+
+@test "unknown role is a usage error" {
+  run "$PROV" --config "$CFG" --role prod --dry-run
+  [ "$status" -eq 2 ]
 }

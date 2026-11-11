@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Render the first-boot cloud-config of the agent VPS to stdout.
 #
-# Usage: agent/render-cloud-init.sh --pubkey FILE
+# Usage: agent/render-cloud-init.sh --pubkey FILE [--role agent|test]
 #
-#   --pubkey FILE  installer's SSH public key; installed for adk-admin in the root-owned
-#                  /etc/ssh/authorized_keys/adk-admin
+#   --pubkey FILE     installer's SSH public key; installed for adk-admin in the root-owned
+#                     /etc/ssh/authorized_keys/adk-admin
+#   --role agent|test which server (default agent): selects the sshd drop-in
+#                     (agent/sshd-adk.conf or test/sshd-adk-test.conf)
 #
 # Exit codes: 0 = rendered, 1 = invalid key / output too large, 2 = usage.
 set -euo pipefail
@@ -16,19 +18,24 @@ ROOT="$(cd "$HERE/.." && pwd)"
 source "$ROOT/scripts/lib/pubkey.sh"
 
 TEMPLATE="$HERE/cloud-init.yaml.tmpl"
-DROPIN="$HERE/sshd-adk.conf"
 MAX_BYTES=32768   # Hetzner Cloud user_data limit
 
-usage() { echo "usage: $0 --pubkey FILE" >&2; exit 2; }
+usage() { echo "usage: $0 --pubkey FILE [--role agent|test]" >&2; exit 2; }
 
-PUBKEY=""
+PUBKEY="" ROLE=agent
 while (($#)); do
   case "$1" in
     --pubkey) (($# >= 2)) || usage; PUBKEY="$2"; shift 2 ;;
+    --role) (($# >= 2)) || usage; ROLE="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
 [[ -n "$PUBKEY" ]] || usage
+case "$ROLE" in
+  agent) DROPIN="$HERE/sshd-adk.conf" ;;
+  test) DROPIN="$ROOT/test/sshd-adk-test.conf" ;;
+  *) usage ;;
+esac
 
 rc=0
 key="$(adk_read_pubkey "$PUBKEY")" || rc=$?

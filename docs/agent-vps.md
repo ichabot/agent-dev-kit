@@ -70,6 +70,7 @@ der Agent root nicht über einen Symlink auf Dateien wie `/etc/docker/daemon.jso
 | tcp 22, tcp 443, VPN (`VPN_PORT`/`VPN_PROTO`), ICMP | `CUSTOMER_IPS` |
 | tcp 22 (Einrichter) | nur mit `--admin-source`, bei Übergabe entfernen |
 | tcp 80 | weltweit, nur bei `ACME_MODE=http01` (ACME-Challenge + Redirect) |
+| tcp 443 (TEST-VM) | IPv4 + IPv6-Netz des TEST-Servers, sobald er existiert (`docs/test-vm.md`) |
 
 Auf dem Server selbst lauschen nur sshd (22) und Caddy (443, bei `http01` auch 80). Gitea
 hat keinen Host-Port, Caddys Admin-API (`:2019`) ist abgeschaltet (`admin off`), HTTP/3
@@ -514,7 +515,8 @@ noch seinen SSH-Zugang, Schritte 5–6 noch das API-Token.
    `sudo loginctl terminate-session <ID>`.
 5. **Installer-Firewallregel entfernen:** vom Rechner des Einrichters
    `agent/provision.sh` ohne `--admin-source` und ohne `--pubkey` (ersetzt die Regeln,
-   lädt keinen Key hoch).
+   lädt keinen Key hoch; die Regel für die TEST-VM bleibt). Mit TEST-VM stattdessen
+   `test/provision.sh` ohne `--admin-source` (wendet beide Firewalls an, `docs/test-vm.md`).
 6. **SSH-Key-Objekt `adk-<kunde>-installer` im Hetzner-Projekt löschen** (Konsole oder API).
    Sonst bleibt es für Rescue-Modus und Neuinstallation nutzbar.
 7. **Der Kunde widerruft das API-Token des Einrichters und entfernt dessen

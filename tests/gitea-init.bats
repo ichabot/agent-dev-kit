@@ -68,7 +68,7 @@ refute() {
   [ "$(st 's["users"]["anna.mueller"]["admin"]')" = "True" ]
   [ "$(st 's["users"]["anna.mueller"]["must_change"]')" = "True" ]
   # bots: no admin, bot type (no password)
-  for bot in agent-bot prod-pull; do
+  for bot in agent-bot prod-pull test-pull; do
     [ "$(st "s['users']['$bot']['admin']")" = "False" ]
     [ "$(st "s['users']['$bot']['type']")" = "bot" ]
     [ "$(st "s['users']['$bot']['password']")" = "None" ]
@@ -77,7 +77,7 @@ refute() {
   [ "$(st '[(t["name"], t["permission"], t["can_create_org_repo"], t["includes_all_repositories"]) for t in s["teams"].values() if t["name"] != "Owners"]')" \
     = "[('developers', 'write', False, False), ('readers', 'read', False, False)]" ]
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "developers"]')" = "[['agent-bot']]" ]
-  [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "readers"]')" = "[['prod-pull']]" ]
+  [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "readers"]')" = "[['prod-pull', 'test-pull']]" ]
   [ "$(st '[t["members"] for t in s["teams"].values() if t["name"] == "Owners"]')" = "[['anna.mueller']]" ]
   # developers: write code, issues, pulls, wiki; only read packages, releases and actions
   [ "$(st '[t["units_map"] for t in s["teams"].values() if t["name"] == "developers"]')" \
@@ -114,6 +114,8 @@ refute() {
   refute grep -qF "$tok" "$FAKE_LOG"
   # no token for prod-pull yet
   [ "$(st 'len([t for t in s["tokens"] if t["user"] == "prod-pull"])')" = "0" ]
+  # test-pull's token is created by agent/test-pull-token.sh, not here
+  [ "$(st 'len([t for t in s["tokens"] if t["user"] == "test-pull"])')" = "0" ]
 }
 
 @test "git credential helper for hermes points at the token file" {
@@ -206,11 +208,12 @@ json.dump(s, open(p, "w"))' "$FAKE_STATE"
   [ -z "$(ls -A "$BATS_TEST_TMPDIR/elsewhere")" ]
 }
 
-@test "both bots may not create repositories in their own namespace (max_repo_creation 0)" {
+@test "the bots may not create repositories in their own namespace (max_repo_creation 0)" {
   run "$INIT" --config "$CFG"
   [ "$status" -eq 0 ]
   [ "$(st 's["users"]["agent-bot"]["max_repo_creation"]')" = "0" ]
   [ "$(st 's["users"]["prod-pull"]["max_repo_creation"]')" = "0" ]
+  [ "$(st 's["users"]["test-pull"]["max_repo_creation"]')" = "0" ]
   [ "$(st 's["users"]["anna.mueller"]["max_repo_creation"]')" = "-1" ]
   : > "$FAKE_LOG"
   run "$INIT" --config "$CFG"

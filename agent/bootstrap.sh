@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# From the installer's machine: copy the kit to a freshly provisioned agent VPS and run
-# agent/setup.sh there.
+# From the installer's machine: copy the kit to a freshly provisioned agent VPS (or TEST VM)
+# and run agent/setup.sh (test/setup.sh) there.
 #
-# Usage: agent/bootstrap.sh [--user USER] [--identity FILE] [--config FILE] <host>
+# Usage: agent/bootstrap.sh [--role agent|test] [--user USER] [--identity FILE] [--config FILE] <host>
 #
+#   --role agent|test  agent (default): copies scripts/ agent/ docs/hermes-tuning.md, runs
+#                    agent/setup.sh; test: copies scripts/ agent/ test/, runs test/setup.sh
 #   --user USER      admin login (default: adk-admin)
 #   --identity FILE  SSH private key (default: ssh's own choice / agent)
 #   --config FILE    kit.env to copy (default: kit.env in the repository root)
@@ -24,21 +26,26 @@ ROOT="$(cd "$HERE/.." && pwd)"
 REMOTE_DIR=/opt/adk
 WAIT_SECONDS="${ADK_SSH_WAIT:-600}"
 
-usage() { echo "usage: $0 [--user USER] [--identity FILE] [--config FILE] <host>" >&2; exit 2; }
+usage() { echo "usage: $0 [--role agent|test] [--user USER] [--identity FILE] [--config FILE] <host>" >&2; exit 2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-USER_NAME=adk-admin CONFIG="$ROOT/kit.env" HOST=""
+USER_NAME=adk-admin CONFIG="$ROOT/kit.env" HOST="" ROLE=agent
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30)
 while (($#)); do
   case "$1" in
+    --role) (($# >= 2)) || usage; ROLE="$2"; shift 2 ;;
     --user) (($# >= 2)) || usage; USER_NAME="$2"; shift 2 ;;
-    --identity) (($# >= 2)) || usage; [[ -f "$2" ]] || usage; SSH_OPTS+=(-o IdentitiesOnly=yes -i "$2"); shift 2 ;;
+    --identity)
+      (($# >= 2)) || usage; [[ -f "$2" ]] || usage
+      # absolute: rsync runs ssh from the staging directory
+      SSH_OPTS+=(-o IdentitiesOnly=yes -i "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); shift 2 ;;
     --config) (($# >= 2)) || usage; CONFIG="$2"; shift 2 ;;
     -*) usage ;;
     *) [[ -z "$HOST" ]] || usage; HOST="$1"; shift ;;
   esac
 done
 [[ -n "$HOST" ]] || usage
+[[ "$ROLE" == agent || "$ROLE" == test ]] || usage
 [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || usage
 [[ "$HOST" =~ ^[A-Za-z0-9.:-]+$ ]] || usage
 [[ -f "$CONFIG" ]] || { echo "ERROR: config file not found: $CONFIG" >&2; exit 2; }
@@ -48,6 +55,7 @@ if [[ -n "${ADK_TLS_INTERNAL:-}" ]]; then
   SETUP_ENV+="ADK_TLS_INTERNAL=1 "
 fi
 if [[ -n "${ADK_RUNNER_ADD_HOST:-}" ]]; then
+  [[ "$ROLE" == agent ]] || { echo "ERROR: ADK_RUNNER_ADD_HOST is for the agent VPS only" >&2; exit 2; }
   [[ "$ADK_RUNNER_ADD_HOST" =~ ^[0-9A-Fa-f.:]+$ ]] || { echo "ERROR: ADK_RUNNER_ADD_HOST must be an IP address" >&2; exit 2; }
   SETUP_ENV+="ADK_RUNNER_ADD_HOST=$ADK_RUNNER_ADD_HOST "
 fi
@@ -62,13 +70,18 @@ done
 
 # --- what is copied: git-tracked files only ---------------------------------
 SYNC_PATHS=(scripts agent docs/hermes-tuning.md)
+SETUP=agent/setup.sh
+if [[ "$ROLE" == test ]]; then
+  SYNC_PATHS=(scripts agent test)
+  SETUP=test/setup.sh
+fi
 git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || die "$ROOT is not a git work tree; bootstrap copies only git-tracked files"
 stray="$(git -C "$ROOT" status --porcelain --ignored --untracked-files=all -- "${SYNC_PATHS[@]}" \
   | grep -E '^(\?\?|!!) ' || true)"
 if [[ -n "$stray" ]]; then
   printf '%s\n' "$stray" >&2
-  die "untracked or ignored files under scripts/ or agent/ (see above); move them out of the repository first"
+  die "untracked or ignored files in the copied directories (see above); move them out of the repository first"
 fi
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -120,9 +133,16 @@ RSYNC_SSH="ssh $(printf '%q ' "${SSH_OPTS[@]}")"
 rsync -p --chown=root:root --chmod=F0600 -e "$RSYNC_SSH" --rsync-path="sudo rsync" \
   "$CONFIG" "$TARGET:$REMOTE_DIR/kit.env"
 
-echo "== running setup.sh"
-remote "sudo $SETUP_ENV$REMOTE_DIR/agent/setup.sh"
+echo "== running $SETUP"
+remote "sudo $SETUP_ENV$REMOTE_DIR/$SETUP"
 
 echo
+if [[ "$ROLE" == test ]]; then
+  echo "Done. Next: CI deploy key and Gitea pull token from the agent VPS (docs/test-vm.md):"
+  echo "  ssh $SSH_TARGET cat /etc/ssh/ssh_host_ed25519_key.pub | ssh adk-admin@<agent> sudo $REMOTE_DIR/agent/test-deploy-key.sh --host $HOST \\"
+  echo "    | ssh $SSH_TARGET sudo $REMOTE_DIR/agent/add-key.sh --forced-command deploy"
+  echo "  ssh adk-admin@<agent> sudo $REMOTE_DIR/agent/test-pull-token.sh | ssh $SSH_TARGET sudo $REMOTE_DIR/agent/set-secret.sh gitea-pull-token"
+  exit 0
+fi
 echo "Done. Add the employee's key for Hermes Desktop (read from stdin, never staged on the VPS):"
 echo "  ssh $SSH_TARGET sudo $REMOTE_DIR/agent/add-key.sh hermes < mitarbeiter.pub"

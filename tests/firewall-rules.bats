@@ -127,3 +127,73 @@ q() {
   [ "$status" -eq 0 ]
   [ ! -e "$marker" ]
 }
+
+# --- agent: HTTPS for the TEST VM -------------------------------------------
+
+@test "--extra-https-source adds a separate https rule for the TEST VM" {
+  run "$FW" --config "$CFG" --extra-https-source 198.51.100.20 --extra-https-source 2001:db8:7::/64
+  [ "$status" -eq 0 ]
+  [ "$(q 'len([x for x in r if x.get("port") == "443"])')" -eq 2 ]
+  [ "$(q '[x["source_ips"] for x in r if x.get("port") == "443"][1]')" = "['198.51.100.20/32', '2001:db8:7::/64']" ]
+  [[ "$(q '[x["description"] for x in r if x.get("port") == "443"][1]')" == *"TEST"* ]]
+  # customer rule unchanged
+  [ "$(q '[x["source_ips"] for x in r if x.get("port") == "443"][0]')" = "['203.0.113.10/32', '198.51.100.0/29', '2001:db8::/48']" ]
+}
+
+@test "--extra-https-source is validated like CUSTOMER_IPS" {
+  for n in 0.0.0.0/0 10.0.0.1 172.16.0.0/24 8.8.0.0/16 nonsense; do
+    run "$FW" --config "$CFG" --extra-https-source "$n"
+    [ "$status" -eq 1 ] || { echo "accepted: $n"; return 1; }
+    [[ "$output" == *"extra-https-source"* ]]
+  done
+}
+
+# --- role test ------------------------------------------------------------
+
+@test "--role test: https, ssh and icmp from CUSTOMER_IPS, no VPN" {
+  run "$FW" --config "$CFG" --role test
+  [ "$status" -eq 0 ]
+  expected="['203.0.113.10/32', '198.51.100.0/29', '2001:db8::/48']"
+  [ "$(q 'len(r)')" -eq 3 ]
+  [ "$(q '[x["source_ips"] for x in r if x.get("port") == "443"][0]')" = "$expected" ]
+  [ "$(q '[x["source_ips"] for x in r if x.get("port") == "22"][0]')" = "$expected" ]
+  [ "$(q '[x["source_ips"] for x in r if x["protocol"] == "icmp"][0]')" = "$expected" ]
+  [ "$(q 'len([x for x in r if x["protocol"] == "udp"])')" -eq 0 ]
+  [ "$(q 'all(x["direction"] == "in" for x in r)')" = "True" ]
+}
+
+@test "--role test: ssh from the agent VPS as its own rule, admin rule too" {
+  run "$FW" --config "$CFG" --role test --extra-ssh-source 203.0.113.50 --extra-ssh-source 2001:db8:5::/64 --admin-source 198.51.100.77
+  [ "$status" -eq 0 ]
+  [ "$(q 'len([x for x in r if x.get("port") == "22"])')" -eq 3 ]
+  [ "$(q '[x["source_ips"] for x in r if x.get("port") == "22"][1]')" = "['203.0.113.50/32', '2001:db8:5::/64']" ]
+  [[ "$(q '[x["description"] for x in r if x.get("port") == "22"][1]')" == *"agent VPS"* ]]
+  [[ "$(q '[x["description"] for x in r if x.get("port") == "22"][2]')" == *"handover"* ]]
+  [ "$(q 'len([x for x in r if x.get("port") == "443"])')" -eq 1 ]
+}
+
+@test "--role test: http01 opens port 80 to the world only" {
+  set_var ACME_MODE http01
+  run "$FW" --config "$CFG" --role test
+  [ "$status" -eq 0 ]
+  [ "$(q '[x["source_ips"] for x in r if x.get("port") == "80"][0]')" = "['0.0.0.0/0', '::/0']" ]
+  [ "$(q 'len([x for x in r if "0.0.0.0/0" in x["source_ips"]])')" -eq 1 ]
+}
+
+@test "--role test: the VPN port may be anything (no VPN on TEST)" {
+  set_var VPN_PROTO tcp
+  set_var VPN_PORT 443
+  run "$FW" --config "$CFG" --role test
+  [ "$status" -eq 0 ]
+}
+
+@test "role-specific options are refused for the other role, unknown role is usage" {
+  run "$FW" --config "$CFG" --extra-ssh-source 203.0.113.50
+  [ "$status" -eq 2 ]
+  run "$FW" --config "$CFG" --role test --extra-https-source 203.0.113.50
+  [ "$status" -eq 2 ]
+  run "$FW" --config "$CFG" --role prod
+  [ "$status" -eq 2 ]
+  run "$FW" --config "$CFG" --role test --extra-ssh-source 10.0.0.1
+  [ "$status" -eq 1 ]
+}

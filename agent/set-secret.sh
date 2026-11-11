@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Store a secret for the agent VPS services in /opt/adk/secrets/<name> (root, 0600).
+# Store a secret for the kit's services in /opt/adk/secrets/<name> (root, 0600): agent VPS
+# and TEST VM.
 #
 # Usage: ssh adk-admin@vps sudo /opt/adk/agent/set-secret.sh <name> < token-file
 #        sudo /opt/adk/agent/set-secret.sh <name>        (prompts, input not shown)
 #
 # Names (whitelist):
-#   dns-api-token   API token of the DNS provider for ACME DNS-01 (Caddy, ACME_MODE=dns01)
+#   dns-api-token     API token of the DNS provider for ACME DNS-01 (Caddy, ACME_MODE=dns01)
+#   gitea-pull-token  TEST VM: read-only Gitea token of the bot test-pull (40 hex characters),
+#                     piped from agent/test-pull-token.sh on the agent VPS
 #
 # The value is read from stdin only (never from argv, which every user can see in ps),
 # must be one line without whitespace or single quotes, and is never printed. Run setup.sh
@@ -15,7 +18,7 @@ set -euo pipefail
 export LC_ALL=C
 umask 077
 
-ALLOWED=(dns-api-token)
+ALLOWED=(dns-api-token gitea-pull-token)
 MAX_LEN=4096
 
 usage() {
@@ -52,6 +55,13 @@ value="${value%$'\r'}"
 ((${#value} <= MAX_LEN)) || die "value longer than $MAX_LEN characters"
 [[ "$value" =~ ^[[:graph:]]+$ ]] || die "the value must not contain whitespace or control characters"
 [[ "$value" != *"'"* ]] || die "the value must not contain a single quote (it is written single-quoted for Caddy)"
+if [[ "$name" == gitea-pull-token && ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+  die "a Gitea token is 40 hex characters (pipe agent/test-pull-token.sh into this script)"
+fi
+case "$name" in
+  dns-api-token) apply="run setup.sh to apply it (recreates caddy)" ;;
+  *) apply="used by the next deployment" ;;
+esac
 
 # --- store it -------------------------------------------------------------------------
 [[ ! -L "$dir" ]] || die "$dir is a symlink; not following it" 2
@@ -76,4 +86,4 @@ printf '%s' "$value" > "$tmp"
 chmod 0600 "$tmp"
 mv -f "$tmp" "$target"
 trap - EXIT
-echo "changed: secret $name stored in $target (mode 0600); run setup.sh to apply it (recreates caddy)"
+echo "changed: secret $name stored in $target (mode 0600); $apply"

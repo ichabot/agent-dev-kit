@@ -105,3 +105,16 @@ refute() {
   run refute test -e "$ADK_SECRETS_DIR"
   [ "$status" -eq 0 ]
 }
+
+@test "gitea-pull-token: 40 hex characters only, stored 0600" {
+  run "$SET" gitea-pull-token <<< "not-a-token"
+  [ "$status" -eq 1 ]
+  run "$SET" gitea-pull-token <<< "0123456789abcdef0123456789abcdef0123456"
+  [ "$status" -eq 1 ]
+  run "$SET" gitea-pull-token <<< "0123456789abcdef0123456789abcdef01234567"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$ADK_SECRETS_DIR/gitea-pull-token")" = "0123456789abcdef0123456789abcdef01234567" ]
+  [ "$(stat -c %a "$ADK_SECRETS_DIR/gitea-pull-token")" = 600 ]
+  [[ "$output" != *"0123456789abcdef"* ]]
+  [[ "$output" == *"next deployment"* ]]
+}

@@ -195,7 +195,7 @@ set_var() {
 }
 
 @test "GITEA_ADMIN_USER must not be a reserved or kit account name" {
-  for bad in admin root agent-bot prod-pull ghost gitea-actions help install metrics avatar \
+  for bad in admin root agent-bot prod-pull test-pull ghost gitea-actions help install metrics avatar \
       captcha commits debug error repo-avatars ssh_info anna.keys anna.gpg anna.rss anna.atom anna.png; do
     set_var GITEA_ADMIN_USER "$bad"
     run "$CHECK" "$CFG"

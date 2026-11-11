@@ -17,6 +17,8 @@
 #   prod-pull         bot account in team "readers" (read code, releases, packages; also only
 #                     in protected repositories); its token is created per PROD server later;
 #                     max_repo_creation 0
+#   test-pull         the same for the TEST VM (team "readers", max_repo_creation 0); its
+#                     read-only token is made by agent/test-pull-token.sh
 #   CUSTOMER_NAME     private organization, owned by GITEA_ADMIN_USER
 #   hermes            ~/.config/gitea/token (agent-bot token, 0600) and a git credential
 #                     helper for https://GITEA_DOMAIN, written AS hermes (lib/user-file.sh)
@@ -45,6 +47,7 @@ source "$ROOT/scripts/lib/config.sh"
 AGENT_USER=hermes
 BOT=agent-bot
 PULL=prod-pull
+TESTPULL=test-pull
 # No write:package: PROD pulls images from the registry, agent-bot must not publish them.
 BOT_SCOPES="write:repository,write:issue,read:user,read:organization,read:package"
 ADMIN_SCOPES="write:organization,write:admin,write:repository,read:user"
@@ -111,7 +114,7 @@ else
   adk_ok "gitea user $ADMIN (site admin)"
 fi
 
-for bot in "$BOT" "$PULL"; do
+for bot in "$BOT" "$PULL" "$TESTPULL"; do
   row="$(user_row "$bot")"
   if [[ -z "$row" ]]; then
     gitea_cli admin user create --username "$bot" --email "$bot@noreply.$DOMAIN" --user-type bot \
@@ -193,23 +196,24 @@ ensure_member() {
 }
 
 ensure_team developers write "$DEV_UNITS" "agent-bot: write on protected repositories, no admin"
-ensure_team readers read "$READ_UNITS" "prod-pull: read code, releases and packages of protected repositories"
+ensure_team readers read "$READ_UNITS" "prod-pull, test-pull: read code, releases and packages of protected repositories"
 ensure_member developers "$BOT"
 ensure_member readers "$PULL"
+ensure_member readers "$TESTPULL"
 
 # Neither bot may own the organization (owners can change branch protection and settings).
 api GET "/orgs/$ORG/teams?limit=50"
 owners="$(json "next((t['id'] for t in d if t['name'] == 'Owners'), '')")"
 [[ -n "$owners" ]] || adk_die "organization $ORG has no Owners team"
-for bot in "$BOT" "$PULL"; do
+for bot in "$BOT" "$PULL" "$TESTPULL"; do
   api GET "/teams/$owners/members/$bot"
   [[ "$API_CODE" == 404 ]] || adk_die "$bot is an owner of $ORG; remove it from the Owners team"
 done
-adk_ok "$BOT and $PULL are not owners of $ORG"
+adk_ok "$BOT, $PULL and $TESTPULL are not owners of $ORG"
 
 # Repositories in their own namespace would make a bot their admin (runners, secrets,
-# webhooks there): neither bot may create any.
-for bot in "$BOT" "$PULL"; do
+# webhooks there): no bot may create any.
+for bot in "$BOT" "$PULL" "$TESTPULL"; do
   limit="$(sql "SELECT max_repo_creation FROM \"user\" WHERE lower_name = '$bot';")"
   if [[ "$limit" == 0 ]]; then
     adk_ok "$bot cannot create repositories (max_repo_creation 0)"
@@ -316,7 +320,7 @@ adk_user_put_block "$AGENT_USER" "$AGENT_HOME" "$AGENT_HOME/.gitconfig" "adk git
 EOF
 
 echo
-echo "gitea-init done: organization $ORG, teams developers/readers, users $ADMIN, $BOT, $PULL"
+echo "gitea-init done: organization $ORG, teams developers/readers, users $ADMIN, $BOT, $PULL, $TESTPULL"
 if [[ -f "$PASSWORD_FILE" ]]; then
   echo "Initial password of $ADMIN: $PASSWORD_FILE (root only); hand it over, then delete the file"
 fi

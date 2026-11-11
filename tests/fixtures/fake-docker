@@ -174,19 +174,19 @@ if cmd[0] == "sqlite3":
         s["tokens"] = [t for t in s["tokens"] if not (t["name"] or "").startswith("adk-init-")]
         save(s)
         sys.exit(0)
-    m = re.match(r"DELETE FROM access_token WHERE uid = (\d+) AND name LIKE 'hermes-%' AND name <> '([^']+)';", q)
+    m = re.match(r"DELETE FROM access_token WHERE uid = (\d+) AND name LIKE '([a-z-]+)-%' AND name <> '([^']+)';", q)
     if m:
         uid = int(m.group(1))
         owner = next(n for n, u in s["users"].items() if u["id"] == uid)
         s["tokens"] = [t for t in s["tokens"]
-                       if not (t["user"] == owner and t["name"].startswith("hermes-") and t["name"] != m.group(2))]
+                       if not (t["user"] == owner and t["name"].startswith(m.group(2) + "-") and t["name"] != m.group(3))]
         save(s)
         sys.exit(0)
     print("fake sqlite3: unsupported query: " + q, file=sys.stderr)
     sys.exit(97)
 
 if cmd[0] == "curl":
-    method, data, url, headers = "GET", None, None, []
+    method, data, url, headers, stdin_body = "GET", None, None, [], False
     j = 1
     while j < len(cmd):
         a = cmd[j]
@@ -200,11 +200,25 @@ if cmd[0] == "curl":
             data = json.loads(cmd[j + 1]); j += 2; continue
         if a == "-w":
             j += 2; continue
+        if a == "-K" and cmd[j + 1] == "-":
+            # curl config on stdin: header = "..." / data = "..." (\\ and \" escaped)
+            for line in sys.stdin.read().splitlines():
+                k, _, v = line.partition(" = ")
+                assert v.startswith('"') and v.endswith('"'), line
+                v = re.sub(r'\\(.)', lambda mm: mm.group(1), v[1:-1])
+                if k == "header":
+                    headers.append(v)
+                elif k == "data":
+                    data = json.loads(v)
+                    stdin_body = True
+                    log("API (body from stdin config)")
+            j += 2; continue
         if a.startswith("http://"):
             url = a
         j += 1
     path = url.split("/api/v1", 1)[1].split("?")[0]
-    log(f"API {method} {path} {json.dumps(data) if data is not None else ''}".rstrip())
+    shown = "<body from stdin>" if stdin_body else (json.dumps(data) if data is not None else "")
+    log(f"API {method} {path} {shown}".rstrip())
     s["api_calls"] = s.get("api_calls", 0) + 1
     save(s)
     fail_after = os.environ.get("FAKE_CURL_FAIL_AFTER")
@@ -290,6 +304,29 @@ if cmd[0] == "curl":
             t = next(t for t in repo["tag_protections"] if t["id"] == int(mt.group(1)))
             t.update(data)
             reply(200, t)
+    m = re.fullmatch(r"/orgs/([^/]+)/actions/(secrets|variables)(/([A-Z0-9_]+))?", path)
+    if m:
+        org, kind, name = m.group(1), m.group(2), m.group(4)
+        owners = next((t for t in s["teams"].values() if t["org"] == org and t["name"] == "Owners"), None)
+        if owners is None or doer not in owners["members"] or "write:organization" not in (tok["scopes"] or ""):
+            reply(403, {"message": "org owner with write:organization needed"})
+        store = s.setdefault("org_" + kind, {})
+        if name is None and method == "GET":
+            reply(200, [{"name": k} for k in store])
+        if kind == "secrets" and method == "PUT":
+            code = 204 if name in store else 201
+            store[name] = data["data"]
+            reply(code)
+        if kind == "variables" and method == "GET":
+            reply(200, {"name": name, "data": store[name]}) if name in store else reply(404)
+        if kind == "variables" and method == "POST":
+            if name in store:
+                reply(409, {"message": "exists"})
+            store[name] = data["value"]
+            reply(201)
+        if kind == "variables" and method == "PUT":
+            store[name] = data["value"]
+            reply(204)
     m = re.fullmatch(r"/orgs/([^/]+)", path)
     if m and method == "GET":
         o = s["orgs"].get(m.group(1))
