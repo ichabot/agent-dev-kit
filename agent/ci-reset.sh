@@ -26,6 +26,12 @@ source "$HERE/lib/ci-runner.sh"
 # shellcheck source-path=SCRIPTDIR source=../scripts/lib/config.sh
 source "$ROOT/scripts/lib/config.sh"
 
+# The unit's Environment= (HOME, XDG_RUNTIME_DIR, DOCKER_HOST of user ci) also reaches this
+# root step: root's docker CLI must never talk to ci's daemon.
+unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG XDG_RUNTIME_DIR
+export HOME=/root
+cd /   # the unit's working directory is the state directory this script deletes
+
 usage() { echo "usage: $0 wipe|prepare [--config FILE]" >&2; exit 2; }
 (($# >= 1)) || usage
 MODE="$1"
@@ -49,7 +55,8 @@ load_config "$CONFIG"
 ((${#CFG_ERRORS[@]} == 0)) || adk_die "invalid $CONFIG (run scripts/check-config.sh)"
 adk_ensure_rootless_docker "$ADK_CI_USER" > /dev/null
 echo "prepared: rootless Docker for $ADK_CI_USER"
-adk_user_env "$ADK_CI_USER" docker pull -q "$ADK_RUNNER_JOB_IMAGE" > /dev/null \
+adk_user_env "$ADK_CI_USER" env DOCKER_HOST="unix:///run/user/$(id -u "$ADK_CI_USER")/docker.sock" \
+    docker pull -q "$ADK_RUNNER_JOB_IMAGE" > /dev/null \
   || adk_die "cannot pull the job image $ADK_RUNNER_JOB_IMAGE"
 echo "pulled: job image (pinned digest)"
 adk_runner_register "${CFG[GITEA_DOMAIN]}" "${CFG[CUSTOMER_NAME]}"

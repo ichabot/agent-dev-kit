@@ -122,7 +122,7 @@ esac
 
 # --- tags ---------------------------------------------------------------------------------------
 echo "== $REPO: tags"
-api GET "/repos/$REPO/tags/protections"
+api GET "/repos/$REPO/tag_protections"
 [[ "$API_CODE" == 200 ]] || adk_die "GET tag protections: HTTP $API_CODE"
 rule="$(python3 -I -c '
 import json, sys
@@ -139,11 +139,11 @@ for r in d:
         print(r.get("name_pattern"))' "$API_BODY" "$ADMIN")"
 tag_body="{\"name_pattern\":\"*\",\"whitelist_usernames\":[\"$ADMIN\"],\"whitelist_teams\":[]}"
 if [[ -z "$rule" ]]; then
-  api POST "/repos/$REPO/tags/protections" "$tag_body"
+  api POST "/repos/$REPO/tag_protections" "$tag_body"
   [[ "$API_CODE" == 201 ]] || adk_die "cannot protect tags (HTTP $API_CODE): $API_BODY"
   adk_changed "$REPO tags protected (only $ADMIN creates or deletes tags)"
 elif [[ "${rule#* }" != ok ]]; then
-  api PATCH "/repos/$REPO/tags/protections/${rule%% *}" "$tag_body"
+  api PATCH "/repos/$REPO/tag_protections/${rule%% *}" "$tag_body"
   [[ "$API_CODE" == 200 ]] || adk_die "cannot update the tag protection (HTTP $API_CODE): $API_BODY"
   adk_changed "$REPO tag protection reset (only $ADMIN)"
 else

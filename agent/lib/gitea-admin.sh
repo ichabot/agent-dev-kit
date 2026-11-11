@@ -12,7 +12,8 @@ ADK_GITEA_PASSWORD_FILE=/root/adk-gitea-initial-password
 
 gx() { docker compose -f "$ADK_GITEA_COMPOSE_FILE" exec -T -u git gitea "$@"; }
 gitea_cli() { gx gitea "$@"; }
-sql() { gx sqlite3 /data/gitea/gitea.db "$1" < /dev/null; }
+# (busy timeout: Gitea writes to the same database; without it a busy moment fails the call)
+sql() { gx sqlite3 -cmd '.timeout 15000' /data/gitea/gitea.db "$1" < /dev/null; }
 
 TOKEN=""        # temporary admin token (memory only)
 API_BODY="" API_CODE=""
@@ -125,7 +126,7 @@ for k in ("merge_whitelist_teams", "approvals_whitelist_teams"):
     if r.get(k):
         print(f"default branch {branch}: {k} is not empty")
 ' "$API_BODY" "$branch" "$admin"
-  api GET "/repos/$repo/tags/protections"
+  api GET "/repos/$repo/tag_protections"
   [[ "$API_CODE" == 200 ]] || { echo "tag protections not readable (HTTP $API_CODE)"; return 0; }
   python3 -I -c '
 import json, sys

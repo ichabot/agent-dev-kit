@@ -209,7 +209,8 @@ for bot in "$BOT" "$PULL"; do
   if [[ "$limit" == 0 ]]; then
     adk_ok "$bot cannot create repositories (max_repo_creation 0)"
   else
-    api PATCH "/admin/users/$bot" "{\"source_id\":0,\"login_name\":\"$bot\",\"max_repo_creation\":0}"
+    # (no login_name: Gitea refuses an authentication source for bot accounts)
+    api PATCH "/admin/users/$bot" '{"source_id":0,"max_repo_creation":0}'
     [[ "$API_CODE" == 200 ]] || adk_die "cannot set max_repo_creation of $bot (HTTP $API_CODE): $API_BODY"
     adk_changed "$bot cannot create repositories (max_repo_creation 0)"
   fi

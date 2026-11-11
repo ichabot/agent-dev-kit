@@ -135,7 +135,7 @@ if cmd[:2] == ["gitea", "dump"]:
     sys.exit(0)
 
 if cmd[0] == "sqlite3":
-    q = cmd[2]
+    q = cmd[-1]
     m = re.match(r"SELECT must_change_password FROM \"user\" WHERE lower_name = '([^']+)';", q)
     if m:
         u = next((u for n, u in s["users"].items() if n.lower() == m.group(1)), None)
@@ -219,8 +219,8 @@ if cmd[0] == "curl":
     if m and method == "PATCH":
         if not s["users"][doer]["admin"] or "write:admin" not in (tok["scopes"] or ""):
             reply(403, {"message": "admin scope needed"})
-        if data.get("login_name") != m.group(1) or "source_id" not in data:
-            reply(422, {"message": "login_name and source_id are required"})
+        if s["users"][m.group(1)]["type"] == "bot" and (data.get("login_name") or data.get("source_id") or data.get("password")):
+            reply(400, {"message": "a bot account cannot have a password or authentication source"})
         s["users"][m.group(1)]["max_repo_creation"] = data["max_repo_creation"]
         reply(200, {"login": m.group(1)})
     m = re.fullmatch(r"/orgs/([^/]+)/repos", path)
@@ -252,13 +252,13 @@ if cmd[0] == "curl":
             if method == "PATCH":
                 rule.update(data)
                 reply(200, rule)
-        if sub == "/tags/protections" and method == "GET":
+        if sub == "/tag_protections" and method == "GET":
             reply(200, repo["tag_protections"])
-        if sub == "/tags/protections" and method == "POST":
+        if sub == "/tag_protections" and method == "POST":
             t = dict(data, id=new_id())
             repo["tag_protections"].append(t)
             reply(201, t)
-        mt = re.fullmatch(r"/tags/protections/(\d+)", sub)
+        mt = re.fullmatch(r"/tag_protections/(\d+)", sub)
         if mt and method == "PATCH":
             t = next(t for t in repo["tag_protections"] if t["id"] == int(mt.group(1)))
             t.update(data)

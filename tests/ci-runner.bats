@@ -163,3 +163,17 @@ refute() {
   grep -qx 'NoNewPrivileges=yes' <<< "$output"
   refute grep -qi 'token' <<< "$output"
 }
+
+@test "ci-reset.sh drops the unit's ci environment before acting as root" {
+  # The runner unit sets DOCKER_HOST/XDG_RUNTIME_DIR/HOME of user ci; ExecStartPre=+ inherits them.
+  run grep -nE '^unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG XDG_RUNTIME_DIR$' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
+  [ "$status" -eq 0 ]
+  grep -qx 'export HOME=/root' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
+  grep -qE '^cd /( |$)' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
+  # the env reset happens before the first action (load_config / wipe / prepare)
+  first_action="$(grep -nE '^(load_config|adk_ci_wipe|adk_ensure_rootless_docker)' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh" | head -1 | cut -d: -f1)"
+  unset_line="$(grep -n '^unset DOCKER_HOST' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh" | cut -d: -f1)"
+  [ "$unset_line" -lt "$first_action" ]
+  # the job image is pulled through ci's own socket, explicitly
+  grep -q 'DOCKER_HOST="unix:///run/user/$(id -u "$ADK_CI_USER")/docker.sock"' "$BATS_TEST_DIRNAME/../agent/ci-reset.sh"
+}
