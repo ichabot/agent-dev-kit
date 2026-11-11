@@ -151,6 +151,19 @@ y() {
   refute grep -qE '^ +GITEA__[a-z0-9]+__(SECRET_KEY|INTERNAL_TOKEN|JWT_SECRET|LFS_JWT_SECRET):' "$OUT/compose.yaml"
 }
 
+@test "compose: Gitea runs as the given host uid (default 1000), never root" {
+  need_yaml
+  "$RENDER" --config "$CFG" --out "$OUT"
+  [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["environment"]["USER_UID"]')" = "1000" ]
+  "$RENDER" --config "$CFG" --out "$OUT" --gitea-uid 997
+  [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["environment"]["USER_UID"]')" = "997" ]
+  [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["environment"]["USER_GID"]')" = "997" ]
+  run "$RENDER" --config "$CFG" --out "$OUT" --gitea-uid 0
+  [ "$status" -eq 2 ]
+  run "$RENDER" --config "$CFG" --out "$OUT" --gitea-uid "1 x"
+  [ "$status" -eq 2 ]
+}
+
 @test "unknown DNS provider without a pinned module is refused" {
   set_var DNS_PROVIDER route53
   run "$RENDER" --config "$CFG" --out "$OUT"

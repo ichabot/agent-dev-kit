@@ -73,12 +73,24 @@ adk_caddy_env() {
   token=""
 }
 
+# adk_gitea_user: system user adk-gitea (no login, no home) that owns Gitea's data on the
+# host; the container runs Gitea with its uid/gid (USER_UID/USER_GID). Prints nothing.
+adk_gitea_user() {
+  if ! id adk-gitea > /dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin adk-gitea
+    adk_changed "system user adk-gitea (owner of Gitea's data)"
+  else
+    adk_ok "system user adk-gitea ($(id -u adk-gitea))"
+  fi
+  [[ "$(id -u adk-gitea)" == "$(id -g adk-gitea)" ]] || adk_die "adk-gitea: uid and gid differ; fix the account (Gitea's image uses one id for both)"
+}
+
 # adk_render_services CONFIG: render into /opt/adk/services and /etc/adk/runner.yaml.
 # Sets ADK_COMPOSE_CHANGED / ADK_CADDYFILE_CHANGED / ADK_RUNNER_CONFIG_CHANGED.
 adk_render_services() {
   local config="$1" tmp
   tmp="$(mktemp -d)"
-  "$_ADK_HOST_LIB/../render-services.sh" --config "$config" --out "$tmp" || { rm -rf "$tmp"; adk_die "render-services.sh failed"; }
+  "$_ADK_HOST_LIB/../render-services.sh" --config "$config" --out "$tmp" --gitea-uid "$(id -u adk-gitea)" || { rm -rf "$tmp"; adk_die "render-services.sh failed"; }
   install -d -m 0755 -o root -g root "$ADK_SERVICES_DIR" /etc/adk
   ADK_COMPOSE_CHANGED=false ADK_CADDYFILE_CHANGED=false ADK_RUNNER_CONFIG_CHANGED=false
   adk_put_file "$ADK_COMPOSE_FILE" 0644 root:root < "$tmp/compose.yaml" && ADK_COMPOSE_CHANGED=true
@@ -162,7 +174,7 @@ adk_lab_ca() {
   if [[ "${ADK_TLS_INTERNAL:-}" != 1 ]]; then
     if [[ -e "$ADK_LAB_CA" ]]; then
       rm -f "$ADK_LAB_CA"
-      update-ca-certificates --fresh >/dev/null
+      update-ca-certificates --fresh > /dev/null 2>&1
       adk_changed "lab CA removed from the trust store"
     fi
     return 0
@@ -177,11 +189,11 @@ adk_lab_ca() {
   adk_put_file "$ADK_LAB_CA" 0644 root:root < "$tmp" && changed=true
   rm -f "$tmp"
   if [[ "$changed" == true ]]; then
-    update-ca-certificates >/dev/null
+    update-ca-certificates > /dev/null 2>&1 || adk_die "update-ca-certificates failed"
     for u in "$@"; do
-      id "$u" >/dev/null 2>&1 && adk_user_env "$u" systemctl --user restart docker.service
+      if id "$u" > /dev/null 2>&1; then adk_user_env "$u" systemctl --user restart docker.service; fi
     done
-    systemctl try-restart adk-act-runner.service
+    if [[ -f "$ADK_RUNNER_UNIT" ]]; then systemctl try-restart adk-act-runner.service; fi
   fi
 }
 

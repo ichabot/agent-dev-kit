@@ -278,6 +278,7 @@ echo "== services (gitea, caddy)"
 adk_secrets_dir
 adk_gitea_secrets
 adk_caddy_env "${CFG[ACME_MODE]}"
+adk_gitea_user
 adk_render_services "$ROOT/kit.env"
 adk_services_up
 adk_lab_ca "$AGENT_USER" "$CI_USER"

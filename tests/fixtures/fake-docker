@@ -100,6 +100,22 @@ if cmd[:3] == ["gitea", "admin", "user"]:
     save(s)
     sys.exit(0)
 
+if cmd[:2] == ["gitea", "dump"]:
+    if os.environ.get("FAKE_DUMP_FAIL"):
+        print("fake dump failure", file=sys.stderr)
+        sys.exit(1)
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, data in (("gitea-db.sql", b"CREATE TABLE t (x);\n"), ("app.ini", b"[server]\n"),
+                           ("repos/acme/demo.git/HEAD", b"ref: refs/heads/main\n")):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    sys.stdout.buffer.write(buf.getvalue())
+    sys.exit(0)
+
 if cmd[0] == "sqlite3":
     q = cmd[2]
     m = re.match(r"SELECT must_change_password FROM \"user\" WHERE lower_name = '([^']+)';", q)
