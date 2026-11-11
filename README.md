@@ -32,9 +32,11 @@ In progress: agent VPS base and services (PR 2a/2b). See [docs/plan.md](docs/pla
 | `agent/bootstrap.sh` | Copies the kit to the VPS and runs `agent/setup.sh` there |
 | `agent/setup.sh` | On the VPS: packages, swap, Docker, users `hermes` and `ci` with rootless Docker, egress limits (nftables), Hermes Agent, then the services below |
 | `agent/render-services.sh` | Renders `compose.yaml` (Gitea + Caddy), `Caddyfile` (DNS-01/HTTP-01, admin API off) and the runner config from `kit.env` |
-| `agent/gitea-init.sh` | Gitea organization, teams and accounts (employee admin, `agent-bot`, `prod-pull`); agent-bot token for `hermes` |
+| `agent/gitea-init.sh` | Gitea organization, teams and accounts (employee admin, `agent-bot`, `prod-pull`); agent-bot token for `hermes`; warns about unprotected repositories |
+| `agent/protect-repo.sh` | Protects a repository: default branch only via pull request, merge and approval only by the employee, tags only by the employee |
+| `agent/ci-reset.sh` | Root steps of the CI runner unit: wipe user `ci` after every job, fresh rootless Docker and ephemeral registration before the next |
 | `agent/set-secret.sh` | Stores a whitelisted secret (DNS API token) from stdin in `/opt/adk/secrets` |
-| `agent/backup.sh`, `agent/restore.sh` | Nightly backup (Gitea dump, secrets, home of `hermes`; timer in `agent/systemd/`) and restore |
+| `agent/backup.sh`, `agent/restore.sh` | Nightly backup (Gitea dump, secrets, home of `hermes`; signed MANIFEST; off-site copy encrypted with age; timer in `agent/systemd/`) and restore |
 | `agent/lib/versions.sh` | Pinned image digests, Caddy DNS modules and the runner's sha256 |
 | `agent/add-key.sh`, `agent/remove-key.sh` | Manage SSH keys in the root-owned key files (key from stdin; `--terminate` ends sessions) |
 | `agent/sshd-adk.conf` | sshd drop-in (key-only, no forwarding except Desktop's loopback tunnel) |

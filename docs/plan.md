@@ -94,9 +94,11 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 - Keine Secrets in user_data oder Metadaten (Metadaten-Sperre ist nur für die eingeschränkten uids).
 
 **Ergebnisse aus 2b:**
-- `agent-bot` darf keine Repos in der Organisation anlegen: Gitea macht den Ersteller eines Repos zu dessen Admin, damit könnte der Agent den Branch-Schutz abschalten. Repos legt der Mitarbeiter an (für PR 5: Skill „Projekt anlegen“ bittet den Mitarbeiter darum oder nutzt ein root-Hilfsskript).
-- `agent-bot` und `prod-pull` sind Gitea-Bot-Konten (kein Passwort, keine Web-Anmeldung).
-- Branch-Schutz pro Repo setzt der Mitarbeiter (Gitea kennt keinen Organisations-Standard); PR 4/5 liefern dafür eine Anleitung bzw. ein Skript.
+- `agent-bot` darf keine Repos anlegen (Organisation: Team ohne Repo-Anlage; eigener Namensraum: `max_repo_creation 0`): Gitea macht den Ersteller eines Repos zu dessen Admin, damit könnte der Agent den Branch-Schutz abschalten. Repos legt der Mitarbeiter an.
+- `agent-bot` und `prod-pull` sind Gitea-Bot-Konten (kein Passwort, keine Web-Anmeldung). `agent-bot` schreibt Code/Issues/PRs/Wiki, liest Releases, Packages und Actions nur; Token-Scopes ohne `write:package`.
+- Branch- und Tag-Schutz pro Repo setzt `agent/protect-repo.sh <org>/<repo>` (root, idempotent): Standard-Branch nur per PR, Merge und Freigabe nur durch den Mitarbeiter, Tags nur durch den Mitarbeiter. `gitea-init.sh`/`setup.sh` warnen bei ungeschützten Repos. PR 5: Skill „Projekt anlegen“ bittet den Mitarbeiter, das Repo anzulegen und `protect-repo.sh` auszuführen (oder ausführen zu lassen).
+- CI: ein Job pro Runner-Lauf (ephemere Registrierung), root setzt die Umgebung von `ci` vor und nach jedem Job komplett zurück (`agent/ci-reset.sh`). Kein Job kann einen späteren beeinflussen; Basis-Images werden je Job neu geladen.
+- Jeder Branch-Workflow liest alle Actions-Secrets seines Repos (auch ein `write:package`-Token für Registry-Pushes; das Job-Token selbst lehnt die Registry ab) → keine langlebigen Secrets in Repo-Actions-Secrets, PROD vertraut keinen Registry-Tags (siehe PR 4).
 
 **Regeln:**
 - SSH nur Key, kein Passwort, kein root-Login nach Setup (eigener Admin-User mit sudo).
@@ -153,7 +155,13 @@ BACKUP_TARGET=            # optional: Storage Box sftp://...
 7. Fehler in 6 → automatischer Rollback (DB-Restore + alte Version). Protokoll in `update.log`.
 - Weitere Befehle: `--list` (Versionen), `--status`, `--rollback` (letztes Backup), Aufbewahrung `KEEP_BACKUPS=10`.
 
-**CI:** Tests → Lint → Image bauen → **Upgrade-Test** (letzte Release-Version mit Testdaten starten, auf neuen Stand aktualisieren, Zeilenanzahl/Prüfsummen vorher = nachher, außer bei freigegebenen `changing`-Migrationen) → Deploy TEST. Release über Tag `vX.Y.Z`, nur Mitarbeiter darf taggen.
+**CI:** Tests → Lint → Image bauen → **Upgrade-Test** (letzte Release-Version mit Testdaten starten, auf neuen Stand aktualisieren, Zeilenanzahl/Prüfsummen vorher = nachher, außer bei freigegebenen `changing`-Migrationen) → Deploy TEST. Release über Tag `vX.Y.Z`, nur Mitarbeiter darf taggen (geschützte Tags per `protect-repo.sh`).
+
+**Vorgaben aus dem Review von PR 2b (hier umzusetzen):**
+- **PROD vertraut keinen Registry-Tags.** Die Registry lehnt das Job-Token ab (Gitea 28.3); ein Push aus CI braucht ein `write:package`-Token als Actions-Secret, und das liest jeder Workflow – auch einer, den der Agent auf einem Feature-Branch pusht. Er kann damit Images pushen und Tags überschreiben. `update.sh` zieht deshalb nur den **Image-Digest, den das Release festhält**, das der Mitarbeiter auf einem geschützten Tag erstellt (z. B. Digest in den Release-Notizen oder einer Release-Datei, die nur der Release-Workflow des geschützten Tags schreibt), und prüft das gezogene Image gegen diesen Digest.
+- Der Release-Workflow muss so gebaut sein, dass ein Branch-Job diesen Eintrag weder erzeugen noch ändern kann (Job-Token-Rechte mit `permissions:` einschränken, Release-Schritt nur bei `refs/tags/v*` auf dem geschützten Tag, Digest aus dem Build desselben Laufs; prüfen, ob ein Branch-Job ein Release eines geschützten Tags bearbeiten kann – sonst Signatur, z. B. cosign mit einem Schlüssel, den kein Job sieht).
+- **Keine langlebigen Secrets in Actions-Secrets der Repos** (jeder Branch-Workflow liest sie). Der TEST-Deploy-Key (PR 3) ist per `command=` auf `deploy.sh` beschränkt und darf nur TEST erreichen.
+- `uses:`-Actions per Commit-SHA festlegen oder auf Gitea spiegeln (`DEFAULT_ACTIONS_URL` zeigt auf GitHub, Tags sind veränderlich).
 
 **Tasks:** je ein bats-Test zuerst für: Plan-Anzeige, Abbruch ändert nichts, `changing` ohne Versionseingabe abgelehnt, kein Backup → kein Update, Health-Fehler → Rollback, `--rollback` stellt Daten wieder her, `.env` unverändert nach Update, Lint erkennt verbotene Statements.
 
