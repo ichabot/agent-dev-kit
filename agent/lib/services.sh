@@ -82,7 +82,6 @@ adk_gitea_user() {
   else
     adk_ok "system user adk-gitea ($(id -u adk-gitea))"
   fi
-  [[ "$(id -u adk-gitea)" == "$(id -g adk-gitea)" ]] || adk_die "adk-gitea: uid and gid differ; fix the account (Gitea's image uses one id for both)"
 }
 
 # adk_render_services CONFIG: render into /opt/adk/services and /etc/adk/runner.yaml.
@@ -90,7 +89,7 @@ adk_gitea_user() {
 adk_render_services() {
   local config="$1" tmp
   tmp="$(mktemp -d)"
-  "$_ADK_HOST_LIB/../render-services.sh" --config "$config" --out "$tmp" --gitea-uid "$(id -u adk-gitea)" || { rm -rf "$tmp"; adk_die "render-services.sh failed"; }
+  "$_ADK_HOST_LIB/../render-services.sh" --config "$config" --out "$tmp" --gitea-uid "$(id -u adk-gitea)" --gitea-gid "$(id -g adk-gitea)" || { rm -rf "$tmp"; adk_die "render-services.sh failed"; }
   install -d -m 0755 -o root -g root "$ADK_SERVICES_DIR" /etc/adk
   ADK_COMPOSE_CHANGED=false ADK_CADDYFILE_CHANGED=false ADK_RUNNER_CONFIG_CHANGED=false
   adk_put_file "$ADK_COMPOSE_FILE" 0644 root:root < "$tmp/compose.yaml" && ADK_COMPOSE_CHANGED=true

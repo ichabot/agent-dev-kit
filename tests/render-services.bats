@@ -155,9 +155,11 @@ y() {
   need_yaml
   "$RENDER" --config "$CFG" --out "$OUT"
   [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["environment"]["USER_UID"]')" = "1000" ]
-  "$RENDER" --config "$CFG" --out "$OUT" --gitea-uid 997
+  "$RENDER" --config "$CFG" --out "$OUT" --gitea-uid 997 --gitea-gid 994
   [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["environment"]["USER_UID"]')" = "997" ]
-  [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["environment"]["USER_GID"]')" = "997" ]
+  [ "$(y "$OUT/compose.yaml" 'c["services"]["gitea"]["environment"]["USER_GID"]')" = "994" ]
+  run "$RENDER" --config "$CFG" --out "$OUT" --gitea-gid 0
+  [ "$status" -eq 2 ]
   run "$RENDER" --config "$CFG" --out "$OUT" --gitea-uid 0
   [ "$status" -eq 2 ]
   run "$RENDER" --config "$CFG" --out "$OUT" --gitea-uid "1 x"

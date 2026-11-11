@@ -6,10 +6,10 @@
 #   caddy/Dockerfile  only for ACME_MODE=dns01: Caddy with the pinned caddy-dns module
 #   runner.yaml       Gitea runner config (rootless Docker of user ci)
 #
-# Usage: agent/render-services.sh --config FILE --out DIR [--gitea-uid UID]
+# Usage: agent/render-services.sh --config FILE --out DIR [--gitea-uid UID] [--gitea-gid GID]
 #
-#   --gitea-uid UID   host uid/gid the Gitea container runs as (setup.sh: system user
-#                     adk-gitea; default 1000, the image's own default)
+#   --gitea-uid/--gitea-gid  host uid/gid the Gitea container runs as (setup.sh: system
+#                            user adk-gitea; default 1000, the image's own default)
 #
 # Lab/test overrides (environment only, deliberately NOT kit.env keys):
 #   ADK_TLS_INTERNAL=1         Caddy uses its internal CA ("tls internal") instead of ACME;
@@ -32,19 +32,21 @@ SECRETS_DIR=/opt/adk/secrets
 GITEA_DATA=/var/lib/adk/gitea
 RUNNER_STATE=/var/lib/adk-runner
 
-usage() { echo "usage: $0 --config FILE --out DIR [--gitea-uid UID]" >&2; exit 2; }
+usage() { echo "usage: $0 --config FILE --out DIR [--gitea-uid UID] [--gitea-gid GID]" >&2; exit 2; }
 
-CONFIG="" OUT="" GITEA_UID=1000
+CONFIG="" OUT="" GITEA_UID=1000 GITEA_GID=1000
 while (($#)); do
   case "$1" in
     --config) (($# >= 2)) || usage; CONFIG="$2"; shift 2 ;;
     --out) (($# >= 2)) || usage; OUT="$2"; shift 2 ;;
     --gitea-uid) (($# >= 2)) || usage; GITEA_UID="$2"; shift 2 ;;
+    --gitea-gid) (($# >= 2)) || usage; GITEA_GID="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
 [[ -n "$CONFIG" && -n "$OUT" ]] || usage
-[[ "$GITEA_UID" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "ERROR: --gitea-uid must be a non-root uid" >&2; exit 2; }
+[[ "$GITEA_UID" =~ ^[1-9][0-9]{0,8}$ && "$GITEA_GID" =~ ^[1-9][0-9]{0,8}$ ]] \
+  || { echo "ERROR: --gitea-uid/--gitea-gid must be non-root ids" >&2; exit 2; }
 [[ -d "$OUT" ]] || { echo "ERROR: output directory $OUT does not exist" >&2; exit 2; }
 
 TLS_INTERNAL="${ADK_TLS_INTERNAL:-}"
@@ -142,7 +144,7 @@ services:
       - no-new-privileges:true
     environment:
       USER_UID: "$GITEA_UID"
-      USER_GID: "$GITEA_UID"
+      USER_GID: "$GITEA_GID"
       GITEA__database__DB_TYPE: "sqlite3"
       GITEA__database__PATH: "/data/gitea/gitea.db"
       GITEA__server__DOMAIN: "$DOMAIN"
